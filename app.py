@@ -742,7 +742,7 @@ async def instagram_reel(url: str = Query(...), key: str = Query(...)):
         raise HTTPException(status_code=403, detail="Invalid API key")
     # Run gallery-dl in thread to avoid blocking
     loop = asyncio.get_event_loop()
-    results, normalized_url = await loop.run_in_executor(None, get_instagram_json_data, normalize_instagram_url(url), "/app/cookies/insta.txt")
+    results, normalized_url = await loop.run_in_executor(None, get_instagram_json_data, normalize_instagram_url(url), "./cookies/insta.txt")
 
     media_list = []
     for entry in results:
