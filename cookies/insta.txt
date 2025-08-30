@@ -1,0 +1,25 @@
+# Netscape HTTP Cookie File
+
+.instagram.com	TRUE	/	TRUE	1784370118	datr	zftLaBufA6qARtfbVZLAVJwl
+.instagram.com	TRUE	/	TRUE	1781346118	ig_did	CA5711AA-C53B-4998-8644-D28991132393
+.instagram.com	TRUE	/	TRUE	1784370118	mid	aEv7zQALAAFdlXDwdRisAeWUHGe9
+.instagram.com	TRUE	/	TRUE	1781346128	ig_nrcb	1
+.instagram.com	TRUE	/	TRUE	1764154635	ds_user_id	50378979286
+.instagram.com	TRUE	/	TRUE	1784375496	ps_l	1
+.instagram.com	TRUE	/	TRUE	1784375496	ps_n	1
+.instagram.com	TRUE	/	TRUE	1790938635	csrftoken	1dd49a2474e87e4031a1ed941641cf03
+.instagram.com	TRUE	/	TRUE	1756839685	dpr	1.25
+.instagram.com	TRUE	/	TRUE	1787770887	sessionid	50378979286%3AsdCrmxQ8rkYAeE%3A10%3AAYevSuGhDhmvTzC50v6YYBUYgvodVJpCkA7WmRT2Y_U
+.instagram.com	TRUE	/	TRUE	0	rur	"EAG\05450378979286\0541787914637:01feeef3e9c1515a6b18a48058a2dac6dc743d4b9f6e0f4bcf2c3e34b926ccd1907ad953"
+.instagram.com	TRUE	/	TRUE	1756839730	wd	1536x776
+sssinstagram.com	FALSE	/	FALSE	1790164138	uid	b47606098d17f587
+sssinstagram.com	FALSE	/	FALSE	1756813739	perf_d2Q82kTy6	1
+sssinstagram.com	FALSE	/	FALSE	1758196139	errorFallbackPopup	78
+sssinstagram.com	FALSE	/	FALSE	1758196139	adsForm	83
+sssinstagram.com	FALSE	/	FALSE	1758196139	adsAfterSearch	79
+sssinstagram.com	FALSE	/	FALSE	1758196139	adsPopupClick	58
+.sssinstagram.com	TRUE	/	FALSE	1790185113	_ga	GA1.1.1735662652.1755624322
+.sssinstagram.com	TRUE	/	TRUE	1789320323	__gads	ID=15568700d0091b80:T=1755624323:RT=1755625105:S=ALNI_MZm2AxdqPMy_LDL99JRLGO9k7Ablw
+.sssinstagram.com	TRUE	/	TRUE	1771176323	__eoi	ID=d560bb42cb68e6d3:T=1755624323:RT=1755625105:S=AA-Afjb80icHNpx6hG4S5D64TVA7
+.sssinstagram.com	TRUE	/	FALSE	1787161115	FCNEC	%5B%5B%22AKsRol8xljqolvx8FweoLB1TX693ZpPgwfqm0rDtnx75L3dqLYJxJ3HECsaxYby7j6qeiDJUtNTglo8OFMBmgNj41Jijm5DeJkjLdokUQP6Lcvg0xXb21j1w84ssatfaWi0hzKVVQ3o2lK51YpPk7r8r1-4aZEthcg%3D%3D%22%5D%5D
+.sssinstagram.com	TRUE	/	FALSE	1790185159	_ga_KDHKH4GDQE	GS2.1.s1755624321$o1$g1$t1755625159$j5$l0$h0

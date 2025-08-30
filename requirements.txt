@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+yt-dlp>=2025.08.11
+gallery-dl
+boto3
+python-dotenv
+pydantic
+uvloop
+httpx
