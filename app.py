@@ -610,17 +610,35 @@ def worker(task_id, data):
         data["status"] = "uploading"
         tasks[task_id]["encrypted"] = encrypt_task_data(data)
 
-        key = output_file
-        upload_with_progress(output_file, key, task_id, data, 95, 100)
-
-        # --- Generate signed URLs (12h expiry) ---
-        urls = generate_signed_urls(key, expire_seconds=43200)
+        r2_key = f"videos/{task_id}.mp4"
+        upload_with_progress(output_file, r2_key, task_id, data, 95, 100)
+        expire_seconds = 43200
+        stream_url = r2.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": R2_BUCKET,
+                "Key": r2_key,
+                "ResponseContentType": "video/mp4",
+                "ResponseContentDisposition": "inline",  # For streaming
+            },
+            ExpiresIn=expire_seconds,
+        )
+        download_url = r2.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": R2_BUCKET,
+                "Key": r2_key,
+                "ResponseContentType": "video/mp4",
+                "ResponseContentDisposition": f'attachment; filename="{os.path.basename(output_file)}"',  # user sees title.mp4
+            },
+            ExpiresIn=expire_seconds,
+        )
 
         data["status"] = "done"
         data["stage"] = "finished"
         data["progress"] = 100
-        data["stream_url"] = urls["stream"]
-        data["download_url"] = urls["download"]
+        data["stream_url"] = stream_url
+        data["download_url"] = download_url
         tasks[task_id]["encrypted"] = encrypt_task_data(data)
 
     except Exception as e:
