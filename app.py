@@ -1,27 +1,24 @@
-import os
-import tempfile
+import os , logging , asyncio
 import asyncio
 import threading
-import shutil
+from datetime import datetime
 import time
 import json
 import base64
 import random
-import re # Added for parsing FFmpeg output
+import re
 from typing import Dict, Any, Optional
 import gallery_dl , sys , io
 import gallery_dl.config
 import gallery_dl.job
-# FastAPI and other core imports
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
-import yt_dlp, uuid
+import yt_dlp, uuid , psutil
 import boto3
 import subprocess
-import httpx
-from botocore.client import Config
+from boto3.s3.transfer import TransferConfig
+from botocore.client import Config as BotocoreConfig
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ---------------- Settings ----------------
@@ -29,23 +26,7 @@ TEMP_DIR = "./videos"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 app = FastAPI()
-app.mount("/static", StaticFiles(directory=TEMP_DIR), name="static")
-
 API_KEY = "all-7f04e0d887372e3769b200d990ae7868"
-R2_ENDPOINT = os.getenv("R2_ENDPOINT")
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_KEY")
-R2_BUCKET_NAME = os.getenv("R2_BUCKET")
-
-# Global S3 client initialization (from your original code)
-s3 = boto3.client(
-    "s3",
-    endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-    config=Config(signature_version="s3v4")
-)
-
 # Global tasks dictionary (from your original code)
 tasks: Dict[str, Dict[str, Any]] = {}
 
@@ -70,6 +51,165 @@ BASE_YTDL_OPTS = {
     },
 }
 
+# make sure env vars present
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+R2_BUCKET = os.getenv("R2_BUCKET")
+R2_REGION = os.getenv("R2_REGION", "auto")  # optional
+
+# R2 endpoint
+R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+# boto3 client
+r2 = boto3.client(
+    "s3",
+    region_name=R2_REGION if R2_REGION else None,
+    endpoint_url=R2_ENDPOINT,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
+    config=BotocoreConfig(signature_version="s3v4"),
+)
+
+def generate_signed_urls(key: str, expire_seconds: int = 43200):
+    """Generate both streaming + download signed URLs (expire in 12h by default)"""
+    # Streaming (inline) - Add Content-Type for video streaming
+    streaming_url = r2.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": R2_BUCKET,
+            "Key": key,
+            "ResponseContentType": "video/mp4",
+            "ResponseContentDisposition": "inline",  # Just inline without filename for streaming
+        },
+        ExpiresIn=expire_seconds,
+    )
+
+    # Download (attachment)
+    download_url = r2.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": R2_BUCKET,
+            "Key": key,
+            "ResponseContentType": "video/mp4",
+            "ResponseContentDisposition": f'attachment; filename="{os.path.basename(key)}"',
+        },
+        ExpiresIn=expire_seconds,
+    )
+
+    return {
+        "stream": streaming_url,  # For video player streaming
+        "download": download_url  # For direct download
+    }
+
+class ProgressCallback:
+    def __init__(self, task_id, data, start, end, total_bytes):
+        self.task_id = task_id
+        self.data = data
+        self.start = start
+        self.end = end
+        self.total = float(total_bytes)
+        self.lock = threading.Lock()
+        self.uploaded = 0
+        self.last_ts = time.time()
+        self.last_uploaded = 0
+        # smoothing window
+        self.recent_bytes = 0
+        self.recent_ts = self.last_ts
+
+    def __call__(self, bytes_amount):
+        with self.lock:
+            now = time.time()
+            self.uploaded += bytes_amount
+            # compute percent of this stage
+            percent = 0
+            if self.total > 0:
+                percent = min(int((self.uploaded / self.total) * 100), 100)
+            scaled = self.start + (percent * (self.end - self.start) // 100)
+            # compute upload speed (MiB/s) over last short window
+            dt = now - self.recent_ts
+            if dt <= 0:
+                speed_str = "0MiB"
+            else:
+                self.recent_bytes += bytes_amount
+                # every call older than 0.5s, compute speed and reset
+                if dt >= 0.5:
+                    speed_bps = self.recent_bytes / dt
+                    speed_mib = speed_bps / (1024 * 1024)
+                    speed_str = f"{round(speed_mib, 2)}MiB"
+                    # reset window
+                    self.recent_ts = now
+                    self.recent_bytes = 0
+                else:
+                    # fallback to instant delta from last recorded
+                    delta = self.uploaded - self.last_uploaded
+                    dt_full = now - self.last_ts if (now - self.last_ts) > 0 else 1e-6
+                    speed_mib = (delta / dt_full) / (1024 * 1024)
+                    speed_str = f"{round(speed_mib, 2)}MiB"
+
+            # update last markers
+            self.last_uploaded = self.uploaded
+            self.last_ts = now
+
+            # human readable uploaded / total
+            uploaded_hr = bytes_to_mib_str(self.uploaded)
+            total_hr = bytes_to_mib_str(self.total)
+
+            self.data["progress"] = min(scaled, self.end)
+            self.data["stage"] = "uploading"
+            self.data["uploaded"] = uploaded_hr
+            self.data["total"] = total_hr
+            self.data["speed"] = speed_str
+            tasks[self.task_id]["encrypted"] = encrypt_task_data(self.data)
+
+def upload_with_progress(local_path, key, task_id, data, start=95, end=100):
+    """
+    Upload local_path to R2 with callback; on error update task data and re-raise.
+    """
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(local_path)
+
+    size_bytes = os.path.getsize(local_path)
+    cb = ProgressCallback(task_id, data, start, end, size_bytes)
+
+    transfer_config = TransferConfig(
+        multipart_threshold=5 * 1024 * 1024,
+        multipart_chunksize=5 * 1024 * 1024,
+        max_concurrency=16,
+        use_threads=True,
+    )
+
+    # ensure stage/progress start for upload
+    data["stage"] = "uploading"
+    data["status"] = "uploading"
+    data["progress"] = start
+    data["uploaded"] = "0MiB"
+    data["total"] = bytes_to_mib_str(size_bytes)
+    data["speed"] = "0MiB"
+    tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+    try:
+        r2.upload_file(
+            Filename=local_path,
+            Bucket=R2_BUCKET,
+            Key=key,
+            Callback=cb,
+            Config=transfer_config,
+        )
+    except Exception as e:
+        # attach upload error details to task data
+        data["status"] = "error"
+        data["error"] = f"upload failed: {repr(e)}"
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+        raise  # re-raise so caller (worker) will handle and cleanup
+
+    # ensure final state after success
+    data["progress"] = end
+    data["uploaded"] = bytes_to_mib_str(size_bytes)
+    data["speed"] = "0MiB"
+    tasks[task_id]["encrypted"] = encrypt_task_data(data)
+    return True
+
 # ---------------- Utilities ----------------
 def encrypt_task_data(data: dict) -> str:
     return base64.urlsafe_b64encode(json.dumps(data).encode()).decode()
@@ -77,453 +217,6 @@ def encrypt_task_data(data: dict) -> str:
 def decrypt_task_data(data: str) -> dict:
     return json.loads(base64.urlsafe_b64decode(data.encode()).decode())
 
-def update_task_progress(task_id: str, updates: dict):
-    """Thread-safe task progress update. This uses the existing tasks dictionary."""
-    if task_id in tasks:
-        try:
-            # We must decrypt, update, and re-encrypt because the task data
-            # is stored as an encrypted string in the global 'tasks' dict.
-            current_data = decrypt_task_data(tasks[task_id]["encrypted"])
-            current_data.update(updates)
-            tasks[task_id]["encrypted"] = encrypt_task_data(current_data)
-        except Exception as e:
-            print(f"Error updating task {task_id}: {e}")
-    else:
-        print(f"Warning: Attempted to update non-existent task {task_id}")
-
-
-async def download_file_with_progress(url: str, output_path: str, task_id: str, file_type: str = "video",
-                                      base_progress: int = 0, progress_range: int = 100) -> bool:
-    """Download file using httpx with progress tracking"""
-    try:
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "identity",
-            "Range": "bytes=0-",  # Enable range requests
-        }
-
-        timeout = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=60.0)
-
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
-            follow_redirects=True
-        ) as client:
-
-            # Get file size first
-            try:
-                head_response = await client.head(url, headers=headers)
-                total_size = int(head_response.headers.get("content-length", 0))
-            except Exception as e:
-                print(f"Warning: Could not get total size for {file_type} from HEAD request: {e}. Will try during GET.")
-                total_size = 0
-
-            update_task_progress(task_id, {
-                "stage": f"downloading {file_type}",
-                "download_progress": 0, # Use a separate key for download progress within a stage
-                "total_download_size": total_size
-            })
-
-            downloaded_bytes = 0
-
-            async with client.stream("GET", url, headers=headers) as response:
-                response.raise_for_status()
-
-                # If we couldn't get size from HEAD, try from GET response
-                if not total_size:
-                    total_size = int(response.headers.get("content-length", 0))
-                    update_task_progress(task_id, {"total_download_size": total_size})
-
-                with open(output_path, "wb") as f:
-                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):  # 1MB chunks
-                        if chunk:
-                            f.write(chunk)
-                            downloaded_bytes += len(chunk)
-
-                            # Update overall task progress based on current stage's range
-                            if total_size > 0:
-                                current_stage_percentage = (downloaded_bytes / total_size) * 100
-                                overall_progress = base_progress + (current_stage_percentage / 100 * progress_range)
-                                update_task_progress(task_id, {
-                                    "progress": min(int(overall_progress), base_progress + progress_range -1), # Cap before next stage
-                                    "downloaded_bytes": downloaded_bytes,
-                                    "stage": f"downloading {file_type} ({downloaded_bytes // (1024 * 1024)}MB/{total_size // (1024 * 1024)}MB)"
-                                })
-                            else:
-                                update_task_progress(task_id, {
-                                    "progress": base_progress, # Maintain base if total size is unknown
-                                    "downloaded_bytes": downloaded_bytes,
-                                    "stage": f"downloading {file_type} ({downloaded_bytes // (1024 * 1024)}MB)"
-                                })
-
-        # Verify download
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            print(f"Successfully downloaded {file_type}: {output_path} ({downloaded_bytes} bytes)")
-            return True
-        else:
-            print(f"Download failed or file is empty: {output_path}")
-            return False
-
-    except Exception as e:
-        print(f"Download error for {file_type}: {e}")
-        update_task_progress(task_id, {
-            "status": "error",
-            "error": f"Download failed for {file_type}: {str(e)}",
-            "stage": "failed"
-        })
-        return False
-
-# --- Global variable to track bytes uploaded for the current task ---
-# This dictionary tracks progress per task_id for the current upload operation's callback.
-_upload_progress_tracker: Dict[str, int] = {}
-
-def _upload_progress_callback(task_id: str, total_file_size: int, base_progress_percentage: int, total_progress_range: int):
-    """
-    Callback function for boto3's S3Transfer to update upload progress.
-    Updates the task's progress in the global 'tasks' dictionary.
-    """
-    def callback(bytes_transferred_in_chunk):
-        _upload_progress_tracker[task_id] = _upload_progress_tracker.get(task_id, 0) + bytes_transferred_in_chunk
-        current_uploaded_total = _upload_progress_tracker[task_id]
-
-        if total_file_size > 0:
-            # Calculate percentage of this specific upload
-            upload_percentage_this_stage = (current_uploaded_total / total_file_size) * 100
-            # Map it to the overall task progress range
-            overall_progress = base_progress_percentage + (upload_percentage_this_stage / 100 * total_progress_range)
-            update_task_progress(task_id, {
-                "stage": f"uploading to storage ({current_uploaded_total // (1024 * 1024)}MB/{total_file_size // (1024 * 1024)}MB)",
-                "progress": min(int(overall_progress), base_progress_percentage + total_progress_range - 1), # Cap at 99
-                "uploaded_bytes": current_uploaded_total,
-                "total_upload_size": total_file_size
-            })
-        else:
-            update_task_progress(task_id, {
-                "stage": f"uploading to storage ({current_uploaded_total // (1024 * 1024)}MB)",
-                "progress": base_progress_percentage, # Maintain base if size is unknown
-                "uploaded_bytes": current_uploaded_total
-            })
-    return callback
-
-def upload_to_r2(
-    file_path: str,
-    task_id: str,
-    base_progress_percentage: int, # e.g., 95
-    total_progress_range: int = 5, # e.g., 5 (for 95-100)
-    expiry_seconds: int = 24 * 3600 # 24 hours
-) -> Optional[Dict[str, str]]: # Returns dict of public URLs
-    """
-    Uploads a file to Cloudflare R2 with progress updates and generates presigned URLs.
-    """
-    # Removed from boto3.s3.transfer import S3Transfer as it's not needed with s3.upload_fileobj
-    # S3Transfer is a higher-level abstraction; direct upload_fileobj is better for ExtraArgs and callback.
-
-    if not all([R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
-        print("R2 environment variables not fully set. Cannot upload.")
-        return None
-
-    object_name = os.path.basename(file_path)
-    file_size = os.path.getsize(file_path)
-
-    # Reset uploaded bytes tracker for this specific task before starting new upload
-    _upload_progress_tracker[task_id] = 0
-
-    try:
-        print(f"Task {task_id}: Starting R2 upload for {object_name} (Size: {file_size} bytes)...")
-        with open(file_path, "rb") as f:
-            s3.upload_fileobj(
-                f,
-                R2_BUCKET_NAME,
-                object_name,
-                ExtraArgs={'ContentType': 'video/mp4', 'ACL': 'public-read'}, # Moved ExtraArgs here
-                Callback=_upload_progress_callback(task_id, file_size, base_progress_percentage, total_progress_range)
-            )
-        print(f"Task {task_id}: Upload of {object_name} to R2 completed.")
-
-        # Construct public URL for streaming (adjust based on your R2 custom domain if any)
-        stream_url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": R2_BUCKET_NAME, "Key": object_name},
-            ExpiresIn=expiry_seconds
-        )
-        # Construct public URL for direct download
-        download_url = s3.generate_presigned_url(
-            "get_object",
-            Params={
-                "Bucket": R2_BUCKET_NAME,
-                "Key": object_name,
-                "ResponseContentDisposition": f'attachment; filename="{object_name}"'
-            },
-            ExpiresIn=expiry_seconds
-        )
-
-        # Schedule file deletion after expiry
-        def delete_after_expiry():
-            time.sleep(expiry_seconds)
-            try:
-                s3.delete_object(Bucket=R2_BUCKET_NAME, Key=object_name)
-                print(f"Task {task_id}: Successfully deleted expired R2 object: {object_name}")
-            except Exception as e:
-                print(f"Task {task_id}: Failed to delete expired R2 object {object_name}: {e}")
-
-        threading.Thread(target=delete_after_expiry, daemon=True).start()
-
-        return {"stream_url": stream_url, "download_url": download_url}
-
-    except Exception as e:
-        print(f"Error uploading {object_name} to R2: {e}")
-        raise # Re-raise to be caught by the main download_and_merge error handler
-
-
-def download_and_merge(task_id: str):
-    """Download and merge video/audio using httpx"""
-    # subprocess is already imported globally
-
-    if task_id not in tasks:
-        return
-
-    t = tasks[task_id]
-    data = decrypt_task_data(t["encrypted"])
-    temp_dir = None
-
-    try:
-        update_task_progress(task_id, {
-            "status": "downloading",
-            "stage": "starting download",
-            "progress": 0,
-            "error": None # Clear previous errors
-        })
-
-        # Get format information
-        video_format = data["video_format"]
-        audio_format = data.get("audio_format")
-        needs_merge = data.get("needs_merge", False)
-
-        video_url = video_format.get("url")
-        audio_url = audio_format.get("url") if audio_format else None
-
-        print(f"Task {task_id}: Starting download")
-        print(f"Video URL: {video_url[:100] if video_url else 'None'}...")
-        if audio_url:
-            print(f"Audio URL: {audio_url[:100]}...")
-        print(f"Needs merge: {needs_merge}")
-
-        if not video_url:
-            raise Exception("No video URL found in format data")
-
-        # Create temp directory
-        temp_dir = tempfile.mkdtemp(dir=TEMP_DIR)
-        output_path = os.path.join(temp_dir, f"video_{task_id[:8]}.mp4")
-
-        # Run async downloads in event loop
-        async def download_process():
-            if needs_merge and audio_url:
-                # Download video and audio separately, then merge
-                video_path = os.path.join(temp_dir, f"video_{task_id[:8]}.webm")
-                audio_path = os.path.join(temp_dir, f"audio_{task_id[:8]}.mp3")
-
-                print(f"Task {task_id}: Downloading video and audio separately")
-
-                # Download video (progress 0-45%)
-                video_success = await download_file_with_progress(
-                    video_url, video_path, task_id, "video",
-                    base_progress=0, progress_range=45
-                )
-                if not video_success:
-                    raise Exception("Video download failed")
-
-                # Download audio (progress 45-90%)
-                audio_success = await download_file_with_progress(
-                    audio_url, audio_path, task_id, "audio",
-                    base_progress=45, progress_range=45
-                )
-                if not audio_success:
-                    raise Exception("Audio download failed")
-
-                # Merge with FFmpeg (progress 90-95%)
-                update_task_progress(task_id, {
-                    "stage": "merging video and audio",
-                    "progress": 90
-                })
-
-                total_duration_seconds = 0
-                # Get total duration from video_format metadata if available to improve merge progress tracking
-                # This assumes video_format contains 'duration' in seconds or milliseconds
-                if 'duration' in data['video_format']:
-                    total_duration_seconds = data['video_format'].get('duration', 0)
-                elif 'duration' in data: # Check if top-level data has it
-                     total_duration_seconds = data.get('duration', 0)
-
-                # Use ffmpeg-python library for better control
-                try:
-                    import ffmpeg
-
-                    # Using ffmpeg-python library
-                    input_video = ffmpeg.input(video_path)
-                    input_audio = ffmpeg.input(audio_path)
-
-                    out = ffmpeg.output(
-                        input_video, input_audio, output_path,
-                        vcodec='copy', acodec='aac',
-                        strict='experimental',
-                        avoid_negative_ts='make_zero'
-                    )
-                    
-                    # For ffmpeg-python, getting real-time progress is tricky without parsing stderr directly.
-                    # A more complex setup is needed for that. For now, it will update once at 95.
-                    ffmpeg.run(out, overwrite_output=True, quiet=True)
-                    update_task_progress(task_id, {"stage": "merging video and audio", "progress": 95})
-
-                except ImportError:
-                    # Fallback to subprocess with better error handling and progress tracking
-                    print("ffmpeg-python not installed, using subprocess for merge with progress tracking")
-
-                    ffmpeg_cmd = [
-                        "ffmpeg", "-y",
-                        "-i", video_path, "-i", audio_path,
-                        "-c:v", "copy", "-c:a", "aac",
-                        "-strict", "experimental",
-                        "-avoid_negative_ts", "make_zero",
-                        "-loglevel", "info",  # Use 'info' to get progress output
-                        output_path
-                    ]
-
-                    # Add timeout to prevent hanging
-                    try:
-                        # Use subprocess.Popen for real-time stderr parsing
-                        process = subprocess.Popen(
-                            ffmpeg_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True
-                        )
-
-                        # Regex to find time= entries
-                        time_re = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.?(\d+)?")
-
-                        for line in iter(process.stderr.readline, ''):
-                            match = time_re.search(line)
-                            if match and total_duration_seconds > 0:
-                                hours = int(match.group(1))
-                                minutes = int(match.group(2))
-                                seconds = int(match.group(3))
-                                current_time_seconds = hours * 3600 + minutes * 60 + seconds
-                                
-                                # Map to overall task progress range 90-95
-                                merge_stage_percentage = (current_time_seconds / total_duration_seconds) * 100
-                                # Ensure progress stays within the 90-95 range
-                                overall_progress = 90 + (merge_stage_percentage / 100 * 5)
-                                update_task_progress(task_id, {
-                                    "stage": f"merging video and audio ({int(current_time_seconds)}s / {int(total_duration_seconds)}s)",
-                                    "progress": min(int(overall_progress), 94) # Cap at 94 to leave room for final 95
-                                })
-                            # print(f"FFMPEG_OUT: {line.strip()}") # Uncomment to see full ffmpeg output
-
-                        process.wait(timeout=300) # Wait for process to finish with timeout
-                        if process.returncode != 0:
-                            raise Exception(f"FFmpeg merge failed with error: {process.stderr.read()}")
-                        
-                        print(f"FFmpeg completed successfully")
-                        update_task_progress(task_id, {"stage": "merging video and audio", "progress": 95})
-                        
-                    except subprocess.TimeoutExpired:
-                        process.kill() # Terminate the process if it times out
-                        process.wait()
-                        raise Exception("FFmpeg merge timed out after 5 minutes")
-                    except Exception as e: # Catch other potential errors during subprocess execution
-                        print(f"FFmpeg error: {e}")
-                        raise Exception(f"FFmpeg merge failed: {e}")
-
-                # Verify merged file exists and has content
-                if not os.path.exists(output_path):
-                    raise Exception("FFmpeg merge completed but output file not found")
-
-                merged_size = os.path.getsize(output_path)
-                if merged_size == 0:
-                    raise Exception("FFmpeg merge completed but output file is empty")
-
-                print(f"FFmpeg merge successful. Output size: {merged_size} bytes")
-
-                # Clean up temp files
-                try:
-                    os.remove(video_path)
-                    os.remove(audio_path)
-                except Exception as cleanup_e:
-                    print(f"Warning: Failed to remove temporary video/audio files: {cleanup_e}")
-
-            else:
-                # Single file download (combined format or audio-only) (progress 0-95%)
-                print(f"Task {task_id}: Downloading combined format (no merge needed)")
-                success = await download_file_with_progress(
-                    video_url, output_path, task_id, "video",
-                    base_progress=0, progress_range=95
-                )
-                if not success:
-                    raise Exception("Single file download failed")
-
-        # --- Asyncio event loop handling ---
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If an event loop is already running, run the async task in a new thread
-                def run_in_thread():
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    new_loop.run_until_complete(download_process())
-                    new_loop.close()
-
-                thread = threading.Thread(target=run_in_thread)
-                thread.start()
-                thread.join()
-            else:
-                # If no event loop is running, run it directly
-                loop.run_until_complete(download_process())
-        except RuntimeError:
-            # If get_event_loop() fails (e.g., no loop for current OS thread),
-            # typically in scripts not launched via async main, run it with asyncio.run
-            asyncio.run(download_process())
-        # --- End of asyncio handling ---
-
-        # Verify final file
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise Exception("Final output file not found or empty after download/merge")
-
-        file_size = os.path.getsize(output_path)
-        print(f"Task {task_id}: Download and merge completed. Final file size: {file_size} bytes")
-
-        # Upload to R2 with progress (95-100%)
-        urls = upload_to_r2(output_path, task_id, base_progress_percentage=95, total_progress_range=5)
-        if not urls:
-            raise Exception("Failed to upload to R2")
-
-        update_task_progress(task_id, {
-            "file": urls,
-            "status": "done",
-            "stage": "completed",
-            "progress": 100,
-            "error": None
-        })
-
-        print(f"Task {task_id}: Upload completed successfully")
-
-    except Exception as e:
-        error_message = str(e)
-        print(f"Download failed for task {task_id}: {error_message}")
-        update_task_progress(task_id, {
-            "status": "error",
-            "error": error_message,
-            "stage": "failed"
-        })
-
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-                print(f"Task {task_id}: Cleaned up temp directory")
-            except Exception as e:
-                print(f"Failed to remove temp directory: {e}")
 
 COOKIES_MAP = {
     "youtube.com": "./cookies/yt.txt",
@@ -548,14 +241,45 @@ def sizeof_fmt(num, suffix="B"):
         num /= 1024.0
     return f"{num:.2f} P{suffix}"
 
+CACHE_FILE = "./video_cache.json"
+CACHE_TTL = 12 * 3600  # 12 hours
 
+# Load cache on startup
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, "r") as f:
+        cache = json.load(f)
+else:
+    cache = {}
+
+def get_cached_info(url: str):
+    entry = cache.get(url)
+    if not entry:
+        return None
+    if time.time() - entry.get("timestamp", 0) > CACHE_TTL:
+        del cache[url]
+        save_cache()
+        return None
+    return entry["data"]
+
+def set_cached_info(url: str, data):
+    cache[url] = {"data": data, "timestamp": time.time()}
+    save_cache()
+
+def save_cache():
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f)
+
+MAX_FREE_SIZE = 1 * 1024 * 1024 * 1024
+ # 200MiB limit for free users
 @app.get("/")
 def list_qualities(url: str = Query(...), key: str = Query(...)):
     if key != API_KEY:
         raise HTTPException(403, "Invalid API key")
-    
-    if "instagram.com" in url or "instagr.am" in url:
-        return {"message": f"go to /instagram?url={url}&key={key}"}
+
+    # Check cached data
+    cached = get_cached_info(url)
+    if cached:
+        return cached
 
     # Extract video information
     ydl_opts = {**BASE_YTDL_OPTS, "skip_download": True}
@@ -573,70 +297,92 @@ def list_qualities(url: str = Query(...), key: str = Query(...)):
         raise HTTPException(400, "No video information found")
 
     formats = [f for f in info.get("formats", [])
-              if f.get("protocol") not in ("m3u8", "m3u8_native")
-              and f.get("url")
-              and f.get("format_id")]
+               if f.get("protocol") not in ("m3u8", "m3u8_native") and f.get("url") and f.get("format_id")]
 
     if not formats:
         raise HTTPException(400, "No downloadable formats found")
 
-    # Audio formats
+    # --- AUDIO ---
     audio_formats = [f for f in formats if f.get("acodec") and f.get("acodec") != "none" and f.get("vcodec") == "none"]
+    unique_audios = {}
+    for f in sorted(audio_formats, key=lambda x: x.get("abr", 0), reverse=True):
+        ext = f.get("ext")
+        if ext not in unique_audios:
+            unique_audios[ext] = f
+        if len(unique_audios) >= 3:
+            break
 
     audios = []
-    for f in audio_formats:
+    for f in unique_audios.values():
         filesize = f.get("filesize") or f.get("filesize_approx") or 0
         audios.append({
             "quality": f"Audio {f.get('abr', 0)}kbps",
             "ext": f.get("ext"),
             "size": sizeof_fmt(filesize),
-            "url": f.get("url")
+            "url": f.get("url"),
+            "raw_size": filesize
         })
 
-    # Video formats
+    # --- VIDEO ---
     combined_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and f.get("acodec") != "none"]
     video_only_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and (not f.get("acodec") or f.get("acodec") == "none")]
-
     all_video_formats = combined_formats + video_only_formats
-    height_groups = {}
-    for f in all_video_formats:
-        height = f.get("height")
-        if height not in height_groups:
-            height_groups[height] = []
-        height_groups[height].append(f)
 
     qualities = []
-    for height in sorted(height_groups.keys(), reverse=True):
-        best_format = max(height_groups[height], key=lambda f: (f.get("tbr", 0) or 0, f.get("vbr", 0) or 0))
-        filesize = best_format.get("filesize") or best_format.get("filesize_approx") or 0
+    seen_resolutions = set()
+    for f in sorted(all_video_formats, key=lambda x: x.get("height", 0), reverse=True):
+        height = f.get("height")
+        if height in seen_resolutions:
+            continue
+        seen_resolutions.add(height)
 
-        task_id = str(uuid.uuid4())
-        task_data = {
-            "url": url,
-            "video_format": best_format,
-            "audio_format": None,
-            "needs_merge": False,
-            "status": "waiting",
-            "progress": 0,
-            "stage": None,
-            "file": None,
-            "error": None,
-            "timestamp": time.time(),
-            "downloaded_bytes": 0,
-            "total_download_size": 0,
-            "uploaded_bytes": 0,
-            "total_upload_size": 0,
-            "duration": info.get('duration')
-        }
-        tasks[task_id] = {"encrypted": encrypt_task_data(task_data)}
+        video_size = f.get("filesize") or f.get("filesize_approx") or 0
+        best_audio = audios[0] if audios else {"raw_size": 0}
+        total_size = video_size + best_audio.get("raw_size", 0)
 
-        qualities.append({
-            "quality": f"{height}p",
-            "size": sizeof_fmt(filesize),
-            "progress_url": f"/progress/{task_id}?key={key}"
-        })
+        if f.get("acodec") != "none":
+            # already merged
+            qualities.append({
+                "quality": f"{height}p",
+                "size": sizeof_fmt(video_size),
+                "direct_url": f.get("url"),
+                "premium": total_size > MAX_FREE_SIZE
+            })
+        else:
+            if total_size > MAX_FREE_SIZE:
+                # mark as premium, skip creating task
+                qualities.append({
+                    "quality": f"{height}p",
+                    "size": sizeof_fmt(total_size),
+                    "premium": True,
+                    "message": "File too large for free users, membership required"
+                })
+                continue
 
-    return {
+            # create merge task
+            task_id = str(uuid.uuid4())
+            task_data = {
+                "url": url,
+                "video_format": f,
+                "title": info.get("title", "Unknown"),
+                "audio_format": best_audio,
+                "needs_merge": True,
+                "status": "waiting",
+                "progress": 0,
+                "stage": None,
+                "file": None,
+                "error": None,
+                "timestamp": time.time(),
+            }
+            tasks[task_id] = {"encrypted": encrypt_task_data(task_data)}
+
+            qualities.append({
+                "quality": f"{height}p",
+                "size": sizeof_fmt(total_size),
+                "progress_url": f"/progress/{task_id}?key={key}"
+            })
+
+    result = {
         "title": info.get("title", "Unknown"),
         "thumbnail": info.get("thumbnail"),
         "duration": info.get("duration"),
@@ -645,39 +391,350 @@ def list_qualities(url: str = Query(...), key: str = Query(...)):
         "audios": audios
     }
 
+    # Store in cache for future requests
+    set_cached_info(url, result)
+    return result
+
+# helper: turn bytes -> human MiB string (rounded)
+def bytes_to_mib_str(n):
+    return f"{round(n / (1024*1024), 2)}MiB"
+
+# Robust parser for aria2 progress lines
+def parse_aria2_line(line):
+    """
+    Try several patterns and return a dict with any of:
+    { 'downloaded': '27MiB', 'total': '28MiB', 'percent': 95, 'speed': '1.0MiB' }
+    """
+    line = line.strip()
+
+    # Pattern 1 (most complete): downloaded/total(percent) ... DL:speed
+    p1 = re.search(r"([\d\.]+[KkMmGgTtPp]i?[Bb]?)/([\d\.]+[KkMmGgTtPp]i?[Bb]?)\s*\((\d+)%\).*?DL:([\d\.]+\w*)", line)
+    if p1:
+        return {
+            "downloaded": p1.group(1),
+            "total": p1.group(2),
+            "percent": int(p1.group(3)),
+            "speed": p1.group(4),
+        }
+
+    # Pattern 2: downloaded/total(percent) (no DL:)
+    p2 = re.search(r"([\d\.]+[KkMmGgTtPp]i?[Bb]?)/([\d\.]+[KkMmGgTtPp]i?[Bb]?)\s*\((\d+)%\)", line)
+    if p2:
+        return {
+            "downloaded": p2.group(1),
+            "total": p2.group(2),
+            "percent": int(p2.group(3)),
+            "speed": None,
+        }
+
+    # Pattern 3: percent and DL only (e.g. "(95%) ... DL:1.0MiB")
+    p3 = re.search(r"\((\d+)%\).*?DL:([\d\.]+\w*)", line)
+    if p3:
+        return {"percent": int(p3.group(1)), "speed": p3.group(2)}
+
+    # Pattern 4: DL only
+    p4 = re.search(r"DL:([\d\.]+\w*)", line)
+    if p4:
+        return {"speed": p4.group(1)}
+
+    # nothing matched
+    return {}
+
+def run_with_progress(cmd, start, end, task_id, data, output_file=None, update_every_n_lines=1):
+    """
+    Run a subprocess (aria2c) and parse its stdout to update task progress.
+    - `start`/`end` define the scaled progress range for this step (0..100).
+    - `output_file` is used as fallback to compute final size if aria2 output was missed.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
+    )
+
+    matched_any = False
+    line_count = 0
+
+    try:
+        # iterate lines as they arrive (works with text=True)
+        for raw_line in proc.stdout:
+            line_count += 1
+            line = raw_line.strip()
+            # optional debug: print("ARIA2:", line)
+
+            parsed = parse_aria2_line(line)
+            if parsed:
+                matched_any = True
+
+            # Apply parsed fields to data
+            if parsed.get("percent") is not None:
+                percent = parsed["percent"]
+                # scale percent to stage range
+                scaled = start + (percent * (end - start) // 100)
+                data["progress"] = scaled
+
+            if parsed.get("speed") is not None:
+                data["speed"] = parsed["speed"]
+
+            if parsed.get("downloaded") is not None:
+                data["downloaded"] = parsed["downloaded"]
+
+            if parsed.get("total") is not None:
+                data["total"] = parsed["total"]
+
+            # ensure stage remains set (video/audio)
+            data["stage"] = data.get("stage") or ("video" if start < end and start == 0 else data.get("stage"))
+
+            # write update back to tasks — do this not too often to reduce overhead
+            if line_count % update_every_n_lines == 0 or parsed:
+                tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+        # Wait for process to finish (ensure returncode set)
+        proc.wait(timeout=5)
+    except Exception as e:
+        # If we were interrupted, kill process and record error
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        data["status"] = "error"
+        data["error"] = f"run_with_progress exception: {e}"
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+        return False
+
+    # Completed run: ensure final progress and fallback
+    data["progress"] = end
+    data["speed"] = "0MiB"
+
+    if not matched_any and output_file and os.path.exists(output_file):
+        # fallback to actual file size if aria2 produced no parseable output
+        size_bytes = os.path.getsize(output_file)
+        data["downloaded"] = bytes_to_mib_str(size_bytes)
+        data["total"] = data["downloaded"]
+
+    tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+    return proc.returncode == 0
+
+def worker(task_id, data):
+    video_file = audio_file = output_file = None
+    try:
+        video_url = data["video_format"]["url"]
+        audio_url = data["audio_format"]["url"]
+
+        os.makedirs("./tmp", exist_ok=True)
+        video_file = f"./tmp/{task_id}_video.mp4"
+        audio_file = f"./tmp/{task_id}_audio.mp3"
+        title = re.sub(r'[\\/*?:"<>|]', "_", data.get("title", "video"))
+        format = data["video_format"].get("ext", "mp4")
+        output_file = f"./tmp/{title}_{format}.mp4"
+
+        # --- Video download (0–45) ---
+        data["status"] = "downloading"
+        data["stage"] = "video"
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+        save_tasks()
+
+        run_with_progress(
+            [
+                "aria2c",
+                "-x", "16", "-s", "16", "-k", "1M",
+                "--allow-piece-length-change=true",
+                "--file-allocation=none",
+                "--disable-ipv6",
+                "--enable-http-pipelining",
+                "--http-accept-gzip",
+                "--auto-file-renaming=false",
+                "--summary-interval=1",
+                "--timeout=30", "--connect-timeout=30",
+                "--retry-wait=2", "--max-tries=15",
+                "--min-split-size=1M", "--check-integrity=true",
+                "-o", video_file,
+                video_url,
+            ],
+            0, 45, task_id, data, output_file=video_file
+        )
+
+        # --- Audio download (45–90) ---
+        data["stage"] = "audio"
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+        run_with_progress(
+            [
+                "aria2c",
+                "-x", "16", "-s", "16", "-k", "1M",
+                "--allow-piece-length-change=true",
+                "--file-allocation=none",
+                "--disable-ipv6",
+                "--enable-http-pipelining",
+                "--http-accept-gzip",
+                "--auto-file-renaming=false",
+                "--summary-interval=1",
+                "--timeout=30", "--connect-timeout=30",
+                "--retry-wait=2", "--max-tries=15",
+                "--min-split-size=1M", "--check-integrity=true",
+                "-o", audio_file,
+                audio_url,
+            ],
+            45, 90, task_id, data, output_file=audio_file
+        )
+
+        # --- Merge (90–95) ---
+        data["stage"] = "merging"
+        data["status"] = "merging"
+        data["progress"] = 90
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-nostdin",
+                "-i", video_file,
+                "-i", audio_file,
+                "-c", "copy",
+                output_file
+            ],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg failed: {result.stderr}")
+
+        # mark merge done
+        data["progress"] = 95
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+        # --- Upload (95–100) ---
+        data["stage"] = "uploading"
+        data["status"] = "uploading"
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+        key = output_file
+        upload_with_progress(output_file, key, task_id, data, 95, 100)
+
+        # --- Generate signed URLs (12h expiry) ---
+        urls = generate_signed_urls(key, expire_seconds=43200)
+
+        data["status"] = "done"
+        data["stage"] = "finished"
+        data["progress"] = 100
+        data["stream_url"] = urls["stream"]
+        data["download_url"] = urls["download"]
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+    except Exception as e:
+        data["status"] = "error"
+        data["error"] = str(e)
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+    finally:
+        # --- Cleanup local files ---
+        for f in [video_file, audio_file, output_file]:
+            try:
+                if f and os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
+
+# Limit of concurrent running tasks
+MAX_PARALLEL_TASKS = 25
+task_semaphore = threading.Semaphore(MAX_PARALLEL_TASKS)
+
+TASKS_FILE = "./tasks.json"
+
+# Load tasks from disk
+if os.path.exists(TASKS_FILE):
+    with open(TASKS_FILE, "r") as f:
+        tasks = json.load(f)
+else:
+    tasks = {}
+
+def save_tasks():
+    with open(TASKS_FILE, "w") as f:
+        json.dump(tasks, f)
+
+# --- Semaphore for concurrent tasks ---
+task_semaphore = threading.Semaphore(MAX_PARALLEL_TASKS)
+
+# --- Worker launcher ---
+def start_task_in_background(task_id, data):
+    def run_worker(task_id, data):
+        try:
+            worker(task_id, data)
+        finally:
+            task_semaphore.release()  # free slot when done
+
+    acquired = task_semaphore.acquire(blocking=False)
+    if acquired:
+        data["status"] = "running"
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+        thread = threading.Thread(target=run_worker, args=(task_id, data), daemon=True)
+        thread.start()
+    else:
+        data["status"] = "queued"
+        tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+# --- Auto-resume tasks on startup ---
+for task_id, task in tasks.items():
+    data = decrypt_task_data(task["encrypted"])
+    if data.get("status") in ["running", "queued"]:
+        # reset any stuck tasks to waiting
+        data["status"] = "waiting"
+        task["encrypted"] = encrypt_task_data(data)
+
+# Save the cleaned-up task states
+save_tasks()
+
+# Start all waiting tasks respecting semaphore
+for task_id, task in tasks.items():
+    data = decrypt_task_data(task["encrypted"])
+    if data.get("status") == "waiting":
+        start_task_in_background(task_id, data)
+
 @app.get("/progress/{task_id}")
 def progress(task_id: str, key: str = Query(...)):
     if key != API_KEY:
         raise HTTPException(403, "Invalid API key")
-
     if task_id not in tasks:
-        return JSONResponse({"status": "unknown", "error": "Task not found"})
+        return {"status": "unknown", "error": "Task not found"}
 
     t = tasks[task_id]
     data = decrypt_task_data(t["encrypted"])
-
-    # Start download if waiting
+    save_cache()
+    # Only start worker if waiting
     if data.get("status") == "waiting":
-        data["status"] = "queued"
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-        threading.Thread(target=download_and_merge, args=(task_id,), daemon=True).start()
 
-    response = {
-        "status": data.get("status", "unknown"),
-        "progress": data.get("progress", 0),
+        # Try to acquire a semaphore slot
+        acquired = task_semaphore.acquire(blocking=False)
+        if acquired:
+            data["status"] = "running"
+            tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+            def run_worker(task_id, data):
+                try:
+                    worker(task_id, data)
+                finally:
+                    # Release semaphore when done
+                    task_semaphore.release()
+
+            thread = threading.Thread(target=run_worker, args=(task_id, data), daemon=True)
+            thread.start()
+        else:
+            # Keep task in waiting state; it will auto-start later
+            data["status"] = "queued"
+            tasks[task_id]["encrypted"] = encrypt_task_data(data)
+
+    return {
+        "status": data.get("status"),
         "stage": data.get("stage"),
-        "error": data.get("error"),
-        "downloaded_bytes": data.get("downloaded_bytes", 0),
-        "total_download_size": data.get("total_download_size", 0),
-        "uploaded_bytes": data.get("uploaded_bytes", 0),
-        "total_upload_size": data.get("total_upload_size", 0)
+        "progress": data.get("progress", 0),
+        "downloaded": data.get("downloaded"),
+        "total": data.get("total"),
+        "speed": data.get("speed"),
+        "stream_url": data.get("stream_url"),
+        "download_url": data.get("download_url"),
     }
-
-    # Add file URLs only when done
-    if data.get("status") == "done" and data.get("file"):
-        response["file"] = data["file"]
-
-    return JSONResponse(response)
 
 @app.get("/health")
 def health_check():
@@ -690,12 +747,18 @@ def cleanup_old_tasks():
             current_time = time.time()
             old_tasks = []
 
-            for task_id, task in tasks.items():
+            for task_id, task in list(tasks.items()):
                 try:
                     data = decrypt_task_data(task["encrypted"])
-                    if current_time - data.get("timestamp", 0) > 3600:  # 1 hour old
+                    if current_time - data.get("timestamp", 0) > 43200:  # 12 hours
+                        # delete from R2 if uploaded
+                        key = f"videos/{task_id}.mp4"
+                        try:
+                            r2.delete_object(Bucket=R2_BUCKET, Key=key)
+                        except Exception as e:
+                            print(f"Failed to delete {key}: {e}")
                         old_tasks.append(task_id)
-                except Exception: # Catch decryption errors for old, malformed tasks
+                except Exception:  # malformed task
                     old_tasks.append(task_id)
 
             for task_id in old_tasks:
@@ -704,7 +767,7 @@ def cleanup_old_tasks():
         except Exception as e:
             print(f"Cleanup error: {e}")
 
-        time.sleep(300)  # Run every 5 minutes
+        time.sleep(300)  # run every 5 minutes
 
 def normalize_instagram_url(url: str) -> str:
     if url.startswith("https:/") and not url.startswith("https://"):
@@ -721,7 +784,6 @@ def get_instagram_json_data(url: str, cookies_path: str):
         gallery_dl.config.set(("extractor", "instagram"), "cookies", cookies_path)
     else:
         raise FileNotFoundError(f"Cookies file not found: {cookies_path}")
-    import logging
     logging.getLogger("gallery_dl").setLevel(logging.CRITICAL)
     gallery_dl.config.set(("core",), "quiet", True)
     f = io.StringIO()
@@ -781,6 +843,143 @@ async def instagram_reel(url: str = Query(...), key: str = Query(...)):
     if not media_list:
         raise HTTPException(status_code=404, detail=f"No media found for {normalized_url}")
     return {"instagram_url": normalized_url, "media": media_list}
+
+
+def normalize_twitter_url(url: str) -> str:
+    """Clean and normalize Twitter/X URL."""
+    url = url.strip()
+    url = re.sub(r"^https?:\/\/(www\.)?(twitter|x)\.com\/", "https://twitter.com/", url)
+    url = re.sub(r"\?.*$", "", url)
+    return url
+
+def get_gallery_dl_data(url: str, cookies_path: str = None):
+    """Fetch media data using gallery-dl."""
+    gallery_dl.config.clear()
+    if cookies_path and os.path.exists(cookies_path):
+        gallery_dl.config.set(("extractor", "twitter"), "cookies", cookies_path)
+    gallery_dl.config.set(("core",), "quiet", True)
+
+    job = gallery_dl.job.DataJob(url)
+    job.run()
+
+    if not job.data:
+        raise RuntimeError(f"No media found for {url}")
+    return job.data
+
+def map_to_clean_json(data):
+    """Transform gallery-dl raw output to clean JSON."""
+    media_list = []
+
+    for entry in data:
+        if isinstance(entry, tuple):
+            type_id = entry[0]
+            if type_id == 2:
+                content = entry[1]
+                media_url = content.get("url") or content.get("filename")
+            elif type_id == 3:
+                media_url = entry[1]
+                content = entry[2]
+            else:
+                continue
+        elif isinstance(entry, dict):
+            content = entry
+            media_url = content.get("url") or content.get("filename")
+        else:
+            continue
+
+        if not media_url:
+            continue
+
+        media_list.append({
+            "tweet_id": content.get("tweet_id"),
+            "username": content.get("user", {}).get("nick") or content.get("author", {}).get("nick"),
+            "author_id": content.get("author", {}).get("id"),
+            "content": content.get("content"),
+            "media_url": media_url,
+            "filename": content.get("filename"),
+            "type": content.get("type") or ("video" if media_url.endswith(".mp4") else "image"),
+            "extension": content.get("extension") or media_url.split(".")[-1],
+            "width": content.get("width"),
+            "height": content.get("height"),
+            "followers_count": content.get("user", {}).get("followers_count"),
+            "view_count": content.get("view_count"),
+            "date": content.get("date").strftime("%Y-%m-%d %H:%M:%S") if isinstance(content.get("date"), datetime) else None
+        })
+
+    return media_list
+
+# ----------------------
+# Endpoint
+# ----------------------
+@app.get("/twitter")
+async def twitter_media(url: str = Query(...), key: str = Query(...)):
+    if key != API_KEY:
+        raise HTTPException(403, "Invalid API key")
+
+    url = normalize_twitter_url(url)
+    cookies = "./cookies/x.txt" if os.path.exists("./cookies/x.txt") else None
+
+    try:
+        data = get_gallery_dl_data(url, cookies_path=cookies)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to fetch data: {str(e)}")
+
+    media_list = map_to_clean_json(data)
+
+    if not media_list:
+        raise HTTPException(404, detail=f"No media found for {url}")
+
+    return {
+        "twitter_url": url,
+        "media": media_list
+    }
+
+@app.get("/stats")
+def stats(key: str = Query(...)):
+    if key != API_KEY:
+        raise HTTPException(403, "Invalid API key")
+    
+    total_tasks = len(tasks)
+    active_tasks = 0
+    total_downloaded_bytes = 0
+    task_details = []
+
+    for task_id, task in tasks.items():
+        data = decrypt_task_data(task["encrypted"])
+        if data.get("status") in ("running", "uploading", "merging"):
+            active_tasks += 1
+
+        downloaded_str = data.get("downloaded")
+        if downloaded_str:
+            match = re.match(r"([\d\.]+)([KMG]i?)B", downloaded_str)
+            if match:
+                num, unit = match.groups()
+                num = float(num)
+                factor = {"K": 1024, "Ki": 1024, "M": 1024**2, "Mi": 1024**2, "G": 1024**3, "Gi": 1024**3}.get(unit, 1)
+                total_downloaded_bytes += int(num * factor)
+        
+        task_details.append({
+            "task_id": task_id,
+            "status": data.get("status"),
+            "stage": data.get("stage"),
+            "progress": data.get("progress", 0),
+            "downloaded": data.get("downloaded"),
+            "total": data.get("total"),
+            "speed": data.get("speed"),
+        })
+
+    # Optional: Render server memory / CPU
+    mem = psutil.virtual_memory()
+    cpu = psutil.cpu_percent(interval=0.1)
+
+    return {
+        "total_tasks": total_tasks,
+        "active_tasks": active_tasks,
+        "total_downloaded": f"{round(total_downloaded_bytes / (1024*1024), 2)} MiB",
+        "tasks": task_details,
+        "memory_usage": f"{round(mem.used / (1024*1024), 2)} MiB / {round(mem.total / (1024*1024), 2)} MiB",
+        "cpu_usage_percent": cpu
+    }
 
 # Start cleanup thread
 threading.Thread(target=cleanup_old_tasks, daemon=True).start()

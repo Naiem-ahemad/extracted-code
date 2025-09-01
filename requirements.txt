@@ -1,9 +1,8 @@
-fastapi
-uvicorn[standard]
-yt-dlp>=2025.08.11
-gallery-dl
-boto3
-python-dotenv
-pydantic
-uvloop
-httpx
+fastapi==0.111.0
+uvicorn[standard]==0.24.0
+yt-dlp==2025.08.03
+gallery-dl==1.27.2
+boto3==1.28.28
+botocore==1.32.28
+python-dotenv==1.1.1
+psutil==5.9.6
