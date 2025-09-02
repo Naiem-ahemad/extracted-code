@@ -13,6 +13,7 @@ import gallery_dl , sys , io
 import gallery_dl.config
 import gallery_dl.job
 from fastapi import FastAPI, Query, HTTPException , Request
+from fastapi.responses import RedirectResponse
 import yt_dlp, uuid , psutil
 import boto3
 import subprocess
@@ -46,7 +47,7 @@ BASE_YTDL_OPTS = {
     "geo_bypass": True,
     "nocheckcertificate": True,
     "socket_timeout": 30,
-    "retries": 5,
+    "retries": 3,
     "http_headers": {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept-Language": "en-US,en;q=0.9",
@@ -271,40 +272,72 @@ def save_cache():
     with open(CACHE_FILE, "w") as f:
         json.dump(cache, f)
 
-def safe_filename(title: str) -> str:
-    return re.sub(r'[\\/*?:"<>| ]+', "-", title)
+def sanitize_filename(filename: str) -> str:
+    filename = re.sub(r'[\\/*?:"<>|]', "_", filename)
+    filename = filename.encode("ascii", errors="ignore").decode()
+    return filename
 
+@app.get("/download-audio")
+def download_audio(url: str = Query(...), key: str = Query(...), title: str = Query("audio")):
+    if key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+    # Decode URL
+    decoded_url = urllib.parse.unquote(url)
+    safe_title = urllib.parse.quote(title)
+
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{safe_title}.mp3"
+    }
+
+    # Stream the file from the source directly to the user
+    def iterfile():
+        with httpx.stream("GET", decoded_url) as r:
+            for chunk in r.iter_bytes(chunk_size=8192):
+                yield chunk
+
+    return StreamingResponse(iterfile(), media_type="audio/mpeg", headers=headers)
+        
 @app.get("/download")
 async def download(
     request: Request,
-    url: str = Query(..., description="Encoded video URL"),
-    title: str = Query("video", description="Video title"),
+    url: str = Query(..., description="Encoded media URL"),
+    title: str = Query("video", description="Media title"),
     key: str = Query(...)
 ):
+    # Security key check
     if key != "all-7f04e0d887372e3769b200d990ae7868":
         raise HTTPException(status_code=403, detail="Invalid key")
 
-    filename = safe_filename(title) + ".mp4"
+    # Sanitize title
+    filename = sanitize_filename(title)
+    encoded_filename = urllib.parse.quote(filename)
 
+    # Prepare headers for streaming request
     headers = {}
-    # Pass through Range header (for resume/partial downloads)
     if "range" in request.headers:
         headers["Range"] = request.headers["range"]
 
-    async def stream_video():
+    async def stream_media():
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+        }
+        if "range" in request.headers:
+            req_headers["Range"] = request.headers["range"]
+
         async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", url, headers=headers, follow_redirects=True) as r:
+            async with client.stream("GET", url, headers=req_headers, follow_redirects=True) as r:
                 if r.status_code not in [200, 206]:
-                    raise HTTPException(status_code=r.status_code, detail="Could not fetch video")
-                async for chunk in r.aiter_bytes(chunk_size=1024 * 1024):  # 1MB chunks
+                    raise HTTPException(status_code=r.status_code, detail="Could not fetch media")
+                async for chunk in r.aiter_bytes(chunk_size=1024 * 1024):
                     yield chunk
 
     return StreamingResponse(
-        stream_video(),
+        stream_media(),
         media_type="video/mp4",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            # forward Content-Length and Range support if possible
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}.mp4",
             "Accept-Ranges": "bytes"
         }
     )
@@ -313,19 +346,46 @@ MAX_FREE_SIZE = 1 * 1024 * 1024 * 1024
  # 200MiB limit for free users
 from fastapi import BackgroundTasks
 
+# Global in-memory store
+url_tasks: dict[str, dict] = {}  # {url: {status, stage, progress, result, error}}
+
 @app.get("/")
 def list_qualities(url: str = Query(...), key: str = Query(...), background_tasks: BackgroundTasks = None):
     if key != API_KEY:
         raise HTTPException(403, "Invalid API key")
 
-    # Check cached data
+    # If cached info exists, return immediately
     cached = get_cached_info(url)
     if cached:
         return cached
 
-    # If no cached data yet, schedule background extraction
+    # Check if extraction for this URL already started
+    if url in url_tasks:
+        task = url_tasks[url]
+        return {
+            "status": task["status"],
+            "stage": task.get("stage"),
+            "progress": task.get("progress", 0),
+            "message": task.get("message"),
+            "result": task.get("result")
+        }
+
+    # Initialize extraction task for URL
+    url_tasks[url] = {
+        "status": "extracting",
+        "stage": "starting",
+        "progress": 0,
+        "message": "Extraction started",
+        "result": None,
+        "error": None
+    }
+
     def extract_and_cache(url: str):
         try:
+            task = url_tasks[url]
+            task["stage"] = "extracting_info"
+            task["progress"] = 10
+
             ydl_opts = {**BASE_YTDL_OPTS, "skip_download": True}
             cookies_file = get_cookies_file(url)
             if cookies_file:
@@ -334,16 +394,13 @@ def list_qualities(url: str = Query(...), key: str = Query(...), background_task
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
-            if not info:
-                return
+            task["stage"] = "processing_formats"
+            task["progress"] = 50
 
             formats = [f for f in info.get("formats", [])
                        if f.get("protocol") not in ("m3u8", "m3u8_native") and f.get("url") and f.get("format_id")]
 
-            if not formats:
-                return
-
-            # --- AUDIO ---
+            # AUDIO
             audio_formats = [f for f in formats if f.get("acodec") and f.get("acodec") != "none" and f.get("vcodec") == "none"]
             unique_audios = {}
             for f in sorted(audio_formats, key=lambda x: x.get("abr", 0), reverse=True):
@@ -352,19 +409,22 @@ def list_qualities(url: str = Query(...), key: str = Query(...), background_task
                     unique_audios[ext] = f
                 if len(unique_audios) >= 3:
                     break
-
             audios = []
             for f in unique_audios.values():
                 filesize = f.get("filesize") or f.get("filesize_approx") or 0
+                audio_url_encoded = urllib.parse.quote_plus(f.get("url"))
+                # Replace problematic characters (including \u2019) for safe filenames/URLs
+                safe_audio_title = re.sub(r'[\\/*?:"<>]', "-", info.get("title", "audio")).replace(" ", "-")
                 audios.append({
                     "quality": f"Audio {f.get('abr', 0)}kbps",
                     "ext": f.get("ext"),
                     "size": sizeof_fmt(filesize),
-                    "url": f.get("url"),
+                    "streaming_url": f.get("url"),
+                    "downloading_url": f"/download-audio?url={audio_url_encoded}&title={safe_audio_title}&key={key}",
                     "raw_size": filesize
                 })
 
-            # --- VIDEO ---
+            # VIDEO
             combined_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and f.get("acodec") != "none"]
             video_only_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and (not f.get("acodec") or f.get("acodec") == "none")]
             all_video_formats = combined_formats + video_only_formats
@@ -376,53 +436,26 @@ def list_qualities(url: str = Query(...), key: str = Query(...), background_task
                 if height in seen_resolutions:
                     continue
                 seen_resolutions.add(height)
-
                 video_size = (f.get("filesize") or f.get("clen") or f.get("filesize_approx") or 0)
                 best_audio = audios[0] if audios else {"raw_size": 0}
                 total_size = video_size + best_audio.get("raw_size", 0)
 
                 if f.get("acodec") != "none":
-                    # already merged (direct stream available)
                     safe_title = re.sub(r'[\\/*?:"<>|]', "-", info.get("title", "video")).replace(" ", "-")
                     ext = f.get("ext") or "mp4"
                     encoded_url = urllib.parse.quote_plus(f.get("url"))
                     qualities.append({
                         "quality": f"{height}p",
                         "size": sizeof_fmt(video_size),
-                        "streaming_url": f.get("url"),  # streaming
-                        "download_url": f"/download?url={encoded_url}&title={safe_title}&key={key}",  # force download
+                        "streaming_url": f.get("url"),
+                        "download_url": f"/download?url={encoded_url}&title={safe_title}&key={key}&type=mp4",
                         "premium": total_size > MAX_FREE_SIZE
                     })
                 else:
-                    if total_size > MAX_FREE_SIZE:
-                        qualities.append({
-                            "quality": f"{height}p",
-                            "size": sizeof_fmt(total_size),
-                            "premium": True,
-                            "message": "File too large for free users, membership required"
-                        })
-                        continue
-
-                    task_id = str(uuid.uuid4())
-                    task_data = {
-                        "url": url,
-                        "video_format": f,
-                        "title": info.get("title", "Unknown"),
-                        "audio_format": best_audio,
-                        "needs_merge": True,
-                        "status": "waiting",
-                        "progress": 0,
-                        "stage": None,
-                        "file": None,
-                        "error": None,
-                        "timestamp": time.time(),
-                    }
-                    tasks[task_id] = {"encrypted": encrypt_task_data(task_data)}
-
                     qualities.append({
                         "quality": f"{height}p",
                         "size": sizeof_fmt(total_size),
-                        "progress_url": f"/progress/{task_id}?key={key}"
+                        "progress_message": "Needs merging (not downloaded yet)"
                     })
 
             result = {
@@ -434,16 +467,33 @@ def list_qualities(url: str = Query(...), key: str = Query(...), background_task
                 "audios": audios
             }
 
-            set_cached_info(url, result)
-        except Exception as e:
-            logging.error(f"Background extraction failed for {url}: {e}")
+            task["stage"] = "done"
+            task["progress"] = 100
+            task["status"] = "done"
+            task["message"] = "Extraction completed"
+            task["result"] = result
 
+            # Save in cache for future hits
+            set_cached_info(url, result)
+
+        except Exception as e:
+            task["stage"] = "error"
+            task["status"] = "error"
+            task["error"] = str(e)
+            task["message"] = f"Extraction failed: {e}"
+            logging.error(f"Extraction failed for {url}: {e}")
+
+    # Start background extraction
     if background_tasks:
         background_tasks.add_task(extract_and_cache, url)
 
-    return {"status": "pending", "message": "Processing, please retry shortly."}
+    return {
+        "status": "extracting",
+        "stage": "starting",
+        "progress": 0,
+        "message": "Extraction started, refresh to see progress"
+    }
 
-# helper: turn bytes -> human MiB string (rounded)
 def bytes_to_mib_str(n):
     return f"{round(n / (1024*1024), 2)}MiB"
 
