@@ -39,7 +39,7 @@ USER_AGENTS = [
 ]
 
 BASE_YTDL_OPTS = {
-    "quiet": True,
+    "quiet": False,
     "no_warnings": True,
     "ignoreerrors": False,
     "extract_flat": False,

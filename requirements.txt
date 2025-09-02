@@ -4,6 +4,6 @@ yt-dlp
 gallery-dl
 boto3
 botocore
+httpx
 python-dotenv
 psutil
-httpx
