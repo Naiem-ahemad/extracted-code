@@ -6,18 +6,20 @@ import time
 import json
 import base64
 import random
-import re
+import re , urllib.parse
+import httpx
 from typing import Dict, Any, Optional
 import gallery_dl , sys , io
 import gallery_dl.config
 import gallery_dl.job
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException , Request
 import yt_dlp, uuid , psutil
 import boto3
 import subprocess
 from boto3.s3.transfer import TransferConfig
 from botocore.client import Config as BotocoreConfig
 from dotenv import load_dotenv
+from fastapi.responses import StreamingResponse
 
 load_dotenv()
 
@@ -269,10 +271,50 @@ def save_cache():
     with open(CACHE_FILE, "w") as f:
         json.dump(cache, f)
 
+def safe_filename(title: str) -> str:
+    return re.sub(r'[\\/*?:"<>| ]+', "-", title)
+
+@app.get("/download")
+async def download(
+    request: Request,
+    url: str = Query(..., description="Encoded video URL"),
+    title: str = Query("video", description="Video title"),
+    key: str = Query(...)
+):
+    if key != "all-7f04e0d887372e3769b200d990ae7868":
+        raise HTTPException(status_code=403, detail="Invalid key")
+
+    filename = safe_filename(title) + ".mp4"
+
+    headers = {}
+    # Pass through Range header (for resume/partial downloads)
+    if "range" in request.headers:
+        headers["Range"] = request.headers["range"]
+
+    async def stream_video():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("GET", url, headers=headers, follow_redirects=True) as r:
+                if r.status_code not in [200, 206]:
+                    raise HTTPException(status_code=r.status_code, detail="Could not fetch video")
+                async for chunk in r.aiter_bytes(chunk_size=1024 * 1024):  # 1MB chunks
+                    yield chunk
+
+    return StreamingResponse(
+        stream_video(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # forward Content-Length and Range support if possible
+            "Accept-Ranges": "bytes"
+        }
+    )
+
 MAX_FREE_SIZE = 1 * 1024 * 1024 * 1024
  # 200MiB limit for free users
+from fastapi import BackgroundTasks
+
 @app.get("/")
-def list_qualities(url: str = Query(...), key: str = Query(...)):
+def list_qualities(url: str = Query(...), key: str = Query(...), background_tasks: BackgroundTasks = None):
     if key != API_KEY:
         raise HTTPException(403, "Invalid API key")
 
@@ -281,119 +323,125 @@ def list_qualities(url: str = Query(...), key: str = Query(...)):
     if cached:
         return cached
 
-    # Extract video information
-    ydl_opts = {**BASE_YTDL_OPTS, "skip_download": True}
-    cookies_file = get_cookies_file(url)
-    if cookies_file:
-        ydl_opts["cookiefile"] = cookies_file
+    # If no cached data yet, schedule background extraction
+    def extract_and_cache(url: str):
+        try:
+            ydl_opts = {**BASE_YTDL_OPTS, "skip_download": True}
+            cookies_file = get_cookies_file(url)
+            if cookies_file:
+                ydl_opts["cookiefile"] = cookies_file
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        raise HTTPException(400, f"Failed to extract video info: {e}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
 
-    if not info:
-        raise HTTPException(400, "No video information found")
+            if not info:
+                return
 
-    formats = [f for f in info.get("formats", [])
-               if f.get("protocol") not in ("m3u8", "m3u8_native") and f.get("url") and f.get("format_id")]
+            formats = [f for f in info.get("formats", [])
+                       if f.get("protocol") not in ("m3u8", "m3u8_native") and f.get("url") and f.get("format_id")]
 
-    if not formats:
-        raise HTTPException(400, "No downloadable formats found")
+            if not formats:
+                return
 
-    # --- AUDIO ---
-    audio_formats = [f for f in formats if f.get("acodec") and f.get("acodec") != "none" and f.get("vcodec") == "none"]
-    unique_audios = {}
-    for f in sorted(audio_formats, key=lambda x: x.get("abr", 0), reverse=True):
-        ext = f.get("ext")
-        if ext not in unique_audios:
-            unique_audios[ext] = f
-        if len(unique_audios) >= 3:
-            break
+            # --- AUDIO ---
+            audio_formats = [f for f in formats if f.get("acodec") and f.get("acodec") != "none" and f.get("vcodec") == "none"]
+            unique_audios = {}
+            for f in sorted(audio_formats, key=lambda x: x.get("abr", 0), reverse=True):
+                ext = f.get("ext")
+                if ext not in unique_audios:
+                    unique_audios[ext] = f
+                if len(unique_audios) >= 3:
+                    break
 
-    audios = []
-    for f in unique_audios.values():
-        filesize = f.get("filesize") or f.get("filesize_approx") or 0
-        audios.append({
-            "quality": f"Audio {f.get('abr', 0)}kbps",
-            "ext": f.get("ext"),
-            "size": sizeof_fmt(filesize),
-            "url": f.get("url"),
-            "raw_size": filesize
-        })
-
-    # --- VIDEO ---
-    combined_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and f.get("acodec") != "none"]
-    video_only_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and (not f.get("acodec") or f.get("acodec") == "none")]
-    all_video_formats = combined_formats + video_only_formats
-
-    qualities = []
-    seen_resolutions = set()
-    for f in sorted(all_video_formats, key=lambda x: x.get("height", 0), reverse=True):
-        height = f.get("height")
-        if height in seen_resolutions:
-            continue
-        seen_resolutions.add(height)
-
-        video_size = f.get("filesize") or f.get("filesize_approx") or 0
-        best_audio = audios[0] if audios else {"raw_size": 0}
-        total_size = video_size + best_audio.get("raw_size", 0)
-
-        if f.get("acodec") != "none":
-            # already merged
-            qualities.append({
-                "quality": f"{height}p",
-                "size": sizeof_fmt(video_size),
-                "direct_url": f.get("url"),
-                "premium": total_size > MAX_FREE_SIZE
-            })
-        else:
-            if total_size > MAX_FREE_SIZE:
-                # mark as premium, skip creating task
-                qualities.append({
-                    "quality": f"{height}p",
-                    "size": sizeof_fmt(total_size),
-                    "premium": True,
-                    "message": "File too large for free users, membership required"
+            audios = []
+            for f in unique_audios.values():
+                filesize = f.get("filesize") or f.get("filesize_approx") or 0
+                audios.append({
+                    "quality": f"Audio {f.get('abr', 0)}kbps",
+                    "ext": f.get("ext"),
+                    "size": sizeof_fmt(filesize),
+                    "url": f.get("url"),
+                    "raw_size": filesize
                 })
-                continue
 
-            # create merge task
-            task_id = str(uuid.uuid4())
-            task_data = {
-                "url": url,
-                "video_format": f,
+            # --- VIDEO ---
+            combined_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and f.get("acodec") != "none"]
+            video_only_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and (not f.get("acodec") or f.get("acodec") == "none")]
+            all_video_formats = combined_formats + video_only_formats
+
+            qualities = []
+            seen_resolutions = set()
+            for f in sorted(all_video_formats, key=lambda x: x.get("height", 0), reverse=True):
+                height = f.get("height")
+                if height in seen_resolutions:
+                    continue
+                seen_resolutions.add(height)
+
+                video_size = (f.get("filesize") or f.get("clen") or f.get("filesize_approx") or 0)
+                best_audio = audios[0] if audios else {"raw_size": 0}
+                total_size = video_size + best_audio.get("raw_size", 0)
+
+                if f.get("acodec") != "none":
+                    # already merged (direct stream available)
+                    safe_title = re.sub(r'[\\/*?:"<>|]', "-", info.get("title", "video")).replace(" ", "-")
+                    ext = f.get("ext") or "mp4"
+                    encoded_url = urllib.parse.quote_plus(f.get("url"))
+                    qualities.append({
+                        "quality": f"{height}p",
+                        "size": sizeof_fmt(video_size),
+                        "streaming_url": f.get("url"),  # streaming
+                        "download_url": f"/download?url={encoded_url}&title={safe_title}&key={key}",  # force download
+                        "premium": total_size > MAX_FREE_SIZE
+                    })
+                else:
+                    if total_size > MAX_FREE_SIZE:
+                        qualities.append({
+                            "quality": f"{height}p",
+                            "size": sizeof_fmt(total_size),
+                            "premium": True,
+                            "message": "File too large for free users, membership required"
+                        })
+                        continue
+
+                    task_id = str(uuid.uuid4())
+                    task_data = {
+                        "url": url,
+                        "video_format": f,
+                        "title": info.get("title", "Unknown"),
+                        "audio_format": best_audio,
+                        "needs_merge": True,
+                        "status": "waiting",
+                        "progress": 0,
+                        "stage": None,
+                        "file": None,
+                        "error": None,
+                        "timestamp": time.time(),
+                    }
+                    tasks[task_id] = {"encrypted": encrypt_task_data(task_data)}
+
+                    qualities.append({
+                        "quality": f"{height}p",
+                        "size": sizeof_fmt(total_size),
+                        "progress_url": f"/progress/{task_id}?key={key}"
+                    })
+
+            result = {
                 "title": info.get("title", "Unknown"),
-                "audio_format": best_audio,
-                "needs_merge": True,
-                "status": "waiting",
-                "progress": 0,
-                "stage": None,
-                "file": None,
-                "error": None,
-                "timestamp": time.time(),
+                "thumbnail": info.get("thumbnail"),
+                "duration": info.get("duration"),
+                "audio_only": False,
+                "qualities": qualities,
+                "audios": audios
             }
-            tasks[task_id] = {"encrypted": encrypt_task_data(task_data)}
 
-            qualities.append({
-                "quality": f"{height}p",
-                "size": sizeof_fmt(total_size),
-                "progress_url": f"/progress/{task_id}?key={key}"
-            })
+            set_cached_info(url, result)
+        except Exception as e:
+            logging.error(f"Background extraction failed for {url}: {e}")
 
-    result = {
-        "title": info.get("title", "Unknown"),
-        "thumbnail": info.get("thumbnail"),
-        "duration": info.get("duration"),
-        "audio_only": False,
-        "qualities": qualities,
-        "audios": audios
-    }
+    if background_tasks:
+        background_tasks.add_task(extract_and_cache, url)
 
-    # Store in cache for future requests
-    set_cached_info(url, result)
-    return result
+    return {"status": "pending", "message": "Processing, please retry shortly."}
 
 # helper: turn bytes -> human MiB string (rounded)
 def bytes_to_mib_str(n):
