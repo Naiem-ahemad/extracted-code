@@ -13,7 +13,7 @@ import gallery_dl , sys , io
 import gallery_dl.config
 import gallery_dl.job
 from fastapi import FastAPI, Query, HTTPException , Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse
 import yt_dlp, uuid , psutil
 import boto3
 import subprocess
@@ -21,7 +21,9 @@ from boto3.s3.transfer import TransferConfig
 from botocore.client import Config as BotocoreConfig
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
-
+from cryptography.fernet import Fernet
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", b'wxk9V_lppKFwN1LzRroxrXOxKxhhRD2GhhxVhwLxflw=')  # Example key; replace with your actual key
+fernet = Fernet(ENCRYPTION_KEY)
 load_dotenv()
 
 # ---------------- Settings ----------------
@@ -215,11 +217,13 @@ def upload_with_progress(local_path, key, task_id, data, start=95, end=100):
 
 # ---------------- Utilities ----------------
 def encrypt_task_data(data: dict) -> str:
-    return base64.urlsafe_b64encode(json.dumps(data).encode()).decode()
+    json_bytes = json.dumps(data, ensure_ascii=False).encode('utf-8')
+    encrypted_bytes = fernet.encrypt(json_bytes)
+    return encrypted_bytes.decode('utf-8')
 
 def decrypt_task_data(data: str) -> dict:
-    return json.loads(base64.urlsafe_b64decode(data.encode()).decode())
-
+    decrypted_bytes = fernet.decrypt(data.encode('utf-8'))
+    return json.loads(decrypted_bytes.decode('utf-8'))
 
 COOKIES_MAP = {
     "youtube.com": "./cookies/yt.txt",
@@ -344,16 +348,47 @@ async def download(
 
 MAX_FREE_SIZE = 1 * 1024 * 1024 * 1024
  # 200MiB limit for free users
-from fastapi import BackgroundTasks
+from fastapi import  BackgroundTasks
 
 # Global in-memory store
 url_tasks: dict[str, dict] = {}  # {url: {status, stage, progress, result, error}}
 
+tasks = {}      # {task_id: {data}}
 @app.get("/")
-def list_qualities(url: str = Query(...), key: str = Query(...), background_tasks: BackgroundTasks = None):
+def list_qualities(url: str = Query(None), key: str = Query(None), background_tasks: BackgroundTasks = None):
+    if url is None or key is None:
+        return JSONResponse(
+            content={
+                "description": "Welcome to the Social Media Downloader made by zer0spectrum.",
+                "endpoints": {
+                    "/": {
+                        "method": "GET",
+                        "description": "Get video/audio qualities and download links",
+                        "parameters": {
+                            "url": "Required. The video URL you want to fetch. eg: youtube-link.",
+                            "key": "Required. Your API key."
+                        }
+                    },
+                    "/download": {
+                        "method": "GET",
+                        "description": "Download video or audio",
+                        "parameters": {
+                            "url": "Required. Video URL",
+                            "format": "Optional. 'video' or 'audio' CDN link like rr3...",
+                            "key": "Required. Your API key."
+                        }
+                    },
+                    "/progress/{task_id}": {
+                        "method": "GET",
+                        "description": "Merge video and audio and give direct streaming and downloading links.",
+                    }
+                }
+            },
+            status_code=400
+        )
+    
     if key != API_KEY:
         raise HTTPException(403, "Invalid API key")
-
     # If cached info exists, return immediately
     cached = get_cached_info(url)
     if cached:
@@ -452,10 +487,34 @@ def list_qualities(url: str = Query(...), key: str = Query(...), background_task
                         "premium": total_size > MAX_FREE_SIZE
                     })
                 else:
+                    if total_size > MAX_FREE_SIZE:
+                        qualities.append({
+                            "quality": f"{height}p",
+                            "size": sizeof_fmt(total_size),
+                            "premium": True,
+                            "message": "File too large for free users, membership required"
+                        })
+                        continue
+                    task_id = str(uuid.uuid4())
+                    task_data = {
+                        "url": url,
+                        "video_format": f,
+                        "title": info.get("title", "Unknown"),
+                        "audio_format": best_audio,
+                        "needs_merge": True,
+                        "status": "waiting",
+                        "progress": 0,
+                        "stage": None,
+                        "file": None,
+                        "error": None,
+                        "timestamp": time.time(),
+                    }
+                    tasks[task_id] = {"encrypted": encrypt_task_data(task_data)}
+
                     qualities.append({
                         "quality": f"{height}p",
                         "size": sizeof_fmt(total_size),
-                        "progress_message": "Needs merging (not downloaded yet)"
+                        "progress_url": f"/progress/{task_id}?key={key}"
                     })
 
             result = {
@@ -620,8 +679,8 @@ def run_with_progress(cmd, start, end, task_id, data, output_file=None, update_e
 def worker(task_id, data):
     video_file = audio_file = output_file = None
     try:
-        video_url = data["video_format"]["url"]
-        audio_url = data["audio_format"]["url"]
+        video_url = data["video_format"].get("url")
+        audio_url = data["audio_format"].get("url") or data["audio_format"].get("streaming_url")
 
         os.makedirs("./tmp", exist_ok=True)
         video_file = f"./tmp/{task_id}_video.mp4"
