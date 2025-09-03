@@ -7,3 +7,4 @@ botocore
 httpx
 python-dotenv
 psutil
+cryptography
