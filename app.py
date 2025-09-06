@@ -646,6 +646,9 @@ def get_full_song_data(song_id: str, title: str):
     except Exception as e:
         return {"title": title, "thumbnail": None, "audio_url": None, "video_url": None, "error": str(e)}
 
+MAX_WORKERS = 15  # Number of parallel threads
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
 def fetch_song_data(song_id: str, title: str, session_id: str, num: int):
     """Background task to fetch full song info"""
     try:
@@ -655,9 +658,10 @@ def fetch_song_data(song_id: str, title: str, session_id: str, num: int):
     except Exception as e:
         CACHE[session_id]["selected"][num]["error"] = str(e)
         CACHE[session_id]["selected"][num]["status"] = "error"
-        
+        logging.error(f"Failed to fetch song {song_id}: {e}")
+
 @app.post("/music_playlist/select")
-def select_songs(req: SelectionRequest, background_tasks: BackgroundTasks):
+def select_songs(req: SelectionRequest):
     clean_cache()
 
     if req.session_id not in CACHE:
@@ -666,6 +670,8 @@ def select_songs(req: SelectionRequest, background_tasks: BackgroundTasks):
     session = CACHE[req.session_id]
     results = []
 
+    # Initialize songs to fetch
+    tasks = []
     for num in req.numbers:
         song = next((s for s in session["songs"] if s["number"] == num), None)
         if not song:
@@ -673,20 +679,22 @@ def select_songs(req: SelectionRequest, background_tasks: BackgroundTasks):
             continue
 
         if num not in session["selected"]:
-            # Initialize as running
             session["selected"][num] = {"status": "running", "data": None, "error": None}
-            # Start background task
-            background_tasks.add_task(fetch_song_data, song["id"], song["title"], req.session_id, num)
-
-        entry = session["selected"][num]
-        # Return current status
-        if entry["status"] == "done":
-            results.append({"number": num, "status": "done", "song": entry["data"]})
-        elif entry["status"] == "error":
-            results.append({"number": num, "status": "error", "error": entry["error"]})
+            tasks.append((song["id"], song["title"], req.session_id, num))
         else:
-            results.append({"number": num, "status": "running"})
+            entry = session["selected"][num]
+            if entry["status"] == "done":
+                results.append({"number": num, "status": "done", "song": entry["data"]})
+            elif entry["status"] == "error":
+                results.append({"number": num, "status": "error", "error": entry["error"]})
+            else:
+                results.append({"number": num, "status": "running"})
 
+    # Submit all new tasks to executor
+    for song_id, title, session_id, num in tasks:
+        executor.submit(fetch_song_data, song_id, title, session_id, num)
+
+    # Return immediately with status
     return {"songs": results}
 
 @app.get("/health")
