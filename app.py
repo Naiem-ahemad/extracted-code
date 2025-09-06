@@ -600,38 +600,6 @@ def extract_playlist(url: str):
         })
     return songs
 
-def get_full_song_data(song_id: str, title: str):
-    """Step 2: Get full song info: thumbnail + audio URL"""
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "nocheckcertificate": True,
-        "ignoreerrors": True,
-        "cachedir": False,
-        "format": "best[height<=360][ext=mp4]/bestaudio/best",
-        "noprogress": True ,
-        "headers" : {
-            "User-Agent": random.choice(USER_AGENTS),},
-        "cookiefile": get_cookies_file("youtube.com")
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://music.youtube.com/watch?v={song_id}", download=False)
-            print(info)
-        audio_url = info["url"]
-    except Exception:
-        audio_url = None  # fallback if extraction fails
-
-    return {
-        "title": title,
-        "thumbnail": info.get("thumbnail"),
-        "audio_url": audio_url,
-        "video_url" : info.get("url")
-    }
-
-# ----------------------
-# ENDPOINTS
-# ----------------------
 @app.post("/music_playlist")
 def create_playlist(req: PlaylistRequest):
     clean_cache()
@@ -652,8 +620,44 @@ def create_playlist(req: PlaylistRequest):
     }
     return {"session_id": session_id, "songs": songs}
 
+def get_full_song_data(song_id: str, title: str):
+    """Step 2: Get full song info: thumbnail + audio URL"""
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+        "ignoreerrors": True,
+        "cachedir": False,
+        "format": "best[height<=360][ext=mp4]/bestaudio/best",
+        "noprogress": True,
+        "headers": {"User-Agent": random.choice(USER_AGENTS)},
+        "cookiefile": get_cookies_file("youtube.com")
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://music.youtube.com/watch?v={song_id}", download=False)
+        audio_url = info.get("url")
+        return {
+            "title": title,
+            "thumbnail": info.get("thumbnail"),
+            "audio_url": audio_url,
+            "video_url": info.get("url")
+        }
+    except Exception as e:
+        return {"title": title, "thumbnail": None, "audio_url": None, "video_url": None, "error": str(e)}
+
+def fetch_song_data(song_id: str, title: str, session_id: str, num: int):
+    """Background task to fetch full song info"""
+    try:
+        data = get_full_song_data(song_id, title)
+        CACHE[session_id]["selected"][num]["data"] = data
+        CACHE[session_id]["selected"][num]["status"] = "done"
+    except Exception as e:
+        CACHE[session_id]["selected"][num]["error"] = str(e)
+        CACHE[session_id]["selected"][num]["status"] = "error"
+        
 @app.post("/music_playlist/select")
-def select_songs(req: SelectionRequest):
+def select_songs(req: SelectionRequest, background_tasks: BackgroundTasks):
     clean_cache()
 
     if req.session_id not in CACHE:
@@ -664,10 +668,24 @@ def select_songs(req: SelectionRequest):
 
     for num in req.numbers:
         song = next((s for s in session["songs"] if s["number"] == num), None)
-        if song:
-            if num not in session["selected"]:
-                session["selected"][num] = get_full_song_data(song["id"], song["title"])
-            results.append(session["selected"][num])
+        if not song:
+            results.append({"number": num, "status": "error", "error": "Song not found"})
+            continue
+
+        if num not in session["selected"]:
+            # Initialize as running
+            session["selected"][num] = {"status": "running", "data": None, "error": None}
+            # Start background task
+            background_tasks.add_task(fetch_song_data, song["id"], song["title"], req.session_id, num)
+
+        entry = session["selected"][num]
+        # Return current status
+        if entry["status"] == "done":
+            results.append({"number": num, "status": "done", "song": entry["data"]})
+        elif entry["status"] == "error":
+            results.append({"number": num, "status": "error", "error": entry["error"]})
+        else:
+            results.append({"number": num, "status": "running"})
 
     return {"songs": results}
 
