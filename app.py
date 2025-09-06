@@ -13,6 +13,9 @@ import gallery_dl.job
 from fastapi import FastAPI, Query, HTTPException , Request
 from fastapi.responses import JSONResponse
 import yt_dlp, uuid , psutil , redis
+from pydantic import BaseModel
+from typing import List , Dict
+from concurrent.futures import  ThreadPoolExecutor , as_completed
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
 from cryptography.fernet import Fernet
@@ -247,32 +250,87 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
     if url is None or key is None:
         return JSONResponse(
             content={
-                "description": "Welcome to the Social Media Downloader made by zer0spectrum.",
-                "endpoints": {
-                    "/": {
-                        "method": "GET",
-                        "description": "Get video/audio qualities and download links",
-                        "parameters": {
-                            "url": "Required. The video URL you want to fetch. eg: youtube-link.",
-                            "key": "Required. Your API key."
+                "description": "Welcome to the Social Media Downloader API by zer0spectrum.",
+                "api_usage": {
+                    "youtube_music_playlist": {
+                        "endpoint": "/music_playlist",
+                        "method": "POST",
+                        "description": "Fetch a playlist from YouTube Music and get song list.",
+                        "body_example": {
+                            "url": "https://music.youtube.com/playlist?list=PLxxxxxxx"
                         }
                     },
-                    "/download": {
-                        "method": "GET",
-                        "description": "Download video or audio",
-                        "parameters": {
-                            "url": "Required. Video URL",
-                            "format": "Optional. 'video' or 'audio' CDN link like rr3...",
-                            "key": "Required. Your API key."
+                    "select_songs_from_playlist": {
+                        "endpoint": "/music_playlist/select",
+                        "method": "POST",
+                        "description": "Select specific songs from a playlist session and get full info.",
+                        "body_example": {
+                            "session_id": "uuid-of-session",
+                            "numbers": [1, 2, 5]
                         }
                     },
-                    "/progress/{task_id}": {
+                    "extract_single_music": {
+                        "endpoint": "/music",
                         "method": "GET",
-                        "description": "Merge video and audio and give direct streaming and downloading links.",
+                        "description": "Get audio stream and thumbnail for a single YouTube Music URL",
+                        "query_example": {
+                            "url": "https://music.youtube.com/watch?v=xxxxxxx",
+                            "key": "YOUR_API_KEY"
+                        }
+                    },
+                    "download_video_or_audio": {
+                        "endpoint": "/download",
+                        "method": "GET",
+                        "description": "Directly download video/audio using streaming URL.",
+                        "query_example": {
+                            "url": "direct-cdn-url",
+                            "title": "My Video",
+                            "key": "YOUR_API_KEY"
+                        }
+                    },
+                    "download_audio_only": {
+                        "endpoint": "/download-audio",
+                        "method": "GET",
+                        "description": "Directly download audio only.",
+                        "query_example": {
+                            "url": "direct-audio-cdn-url",
+                            "title": "My Audio",
+                            "key": "YOUR_API_KEY"
+                        }
+                    },
+                    "instagram_reel": {
+                        "endpoint": "/instagram",
+                        "method": "GET",
+                        "query_example": {
+                            "url": "https://www.instagram.com/reel/xxxx/",
+                            "key": "YOUR_API_KEY"
+                        }
+                    },
+                    "twitter_media": {
+                        "endpoint": "/twitter",
+                        "method": "GET",
+                        "query_example": {
+                            "url": "https://twitter.com/user/status/xxxx",
+                            "key": "YOUR_API_KEY"
+                        }
+                    },
+                    "health_check": {
+                        "endpoint": "/health",
+                        "method": "GET",
+                        "description": "Check server health."
+                    },
+                    "stats": {
+                        "endpoint": "/stats",
+                        "method": "GET",
+                        "query_example": {
+                            "key": "YOUR_API_KEY"
+                        },
+                        "description": "Get task and server statistics."
                     }
-                }
+                },
+                "note": "Replace YOUR_API_KEY with your actual API key."
             },
-            status_code=400
+            status_code=200
         )
     
     if key != API_KEY:
@@ -453,6 +511,165 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
         "progress": 0,
         "message": "Extraction started, refresh to see progress"
     }
+
+def extract_audio_and_thumbnail(url: str):
+    ydl_opts = {
+        "format": "bestaudio/best",  # Only audio
+        "quiet": True,
+        "skip_download": True,
+        "forcejson": True,
+        "nocheckcertificate": True,
+        "ignoreerrors": True,
+        "cachedir": False,
+        "noprogress": True ,
+        "headers" : {
+            "User-Agent": random.choice(USER_AGENTS),},
+        "cookiefile": get_cookies_file("youtube.com")
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return {
+            "title": info.get("title"),
+            "audio_url": info.get("url"),       # Direct audio stream
+            "thumbnail": info.get("thumbnail"), # Thumbnail URL
+        }
+
+@app.get("/music")
+async def extract_audio(url: str = Query(..., description="YouTube or YouTube Music URL") , key: str = Query(..., description="Your API key")):
+    try:
+        result = extract_audio_and_thumbnail(url)
+        return JSONResponse(content=result)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
+
+# ----------------------
+# CACHE
+# ----------------------
+CACHE = {}  # {session_id: {"songs": [...], "created": timestamp, "selected": {}}}
+CACHE_TTL = 5 * 60 * 60  # 5 hours
+
+# ----------------------
+# MODELS
+# ----------------------
+class PlaylistRequest(BaseModel):
+    url: str
+
+class SelectionRequest(BaseModel):
+    session_id: str
+    numbers: list[int]
+
+# ----------------------
+# HELPERS
+# ----------------------
+def clean_cache():
+    """Remove expired sessions"""
+    now = time.time()
+    expired = [sid for sid, val in CACHE.items() if now - val["created"] > CACHE_TTL]
+    for sid in expired:
+        del CACHE[sid]
+
+def extract_playlist(url: str):
+    """Step 1: Return minimal playlist metadata (number + title)"""
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+        "ignoreerrors": True,
+        "cachedir": False,
+        "format": "best[height<=360][ext=mp4]/bestaudio/best",
+        "noprogress": True,
+        "extract_flat": True ,
+        "headers" : {
+            "User-Agent": random.choice(USER_AGENTS),},
+        "cookiefile": get_cookies_file("youtube.com")
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    songs = []
+    for i, entry in enumerate(info.get("entries", []), start=1):
+        if not entry:
+            continue
+        video_id = entry.get("id")
+        songs.append({
+            "number": i,
+            "id": video_id,
+            "title": entry.get("title")
+        })
+    return songs
+
+def get_full_song_data(song_id: str, title: str):
+    """Step 2: Get full song info: thumbnail + audio URL"""
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+        "ignoreerrors": True,
+        "cachedir": False,
+        "format": "best[height<=360][ext=mp4]/bestaudio/best",
+        "noprogress": True ,
+        "headers" : {
+            "User-Agent": random.choice(USER_AGENTS),},
+        "cookiefile": get_cookies_file("youtube.com")
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://music.youtube.com/watch?v={song_id}", download=False)
+            print(info)
+        audio_url = info["url"]
+    except Exception:
+        audio_url = None  # fallback if extraction fails
+
+    return {
+        "title": title,
+        "thumbnail": info.get("thumbnail"),
+        "audio_url": audio_url,
+        "video_url" : info.get("url")
+    }
+
+# ----------------------
+# ENDPOINTS
+# ----------------------
+@app.post("/music_playlist")
+def create_playlist(req: PlaylistRequest):
+    clean_cache()
+
+    # Check if playlist is already cached
+    for sid, val in CACHE.items():
+        if val.get("url") == req.url:
+            return {"session_id": sid, "songs": val["songs"]}
+
+    # Not cached, fetch fresh
+    songs = extract_playlist(req.url)
+    session_id = str(uuid.uuid4())
+    CACHE[session_id] = {
+        "url": req.url,
+        "songs": songs,
+        "created": time.time(),
+        "selected": {}
+    }
+    return {"session_id": session_id, "songs": songs}
+
+@app.post("/music_playlist/select")
+def select_songs(req: SelectionRequest):
+    clean_cache()
+
+    if req.session_id not in CACHE:
+        return {"error": "Invalid or expired session"}
+
+    session = CACHE[req.session_id]
+    results = []
+
+    for num in req.numbers:
+        song = next((s for s in session["songs"] if s["number"] == num), None)
+        if song:
+            if num not in session["selected"]:
+                session["selected"][num] = get_full_song_data(song["id"], song["title"])
+            results.append(session["selected"][num])
+
+    return {"songs": results}
 
 @app.get("/health")
 def health_check():
