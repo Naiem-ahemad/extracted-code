@@ -1,39 +1,34 @@
 import os , logging , asyncio
 import asyncio
-import threading
 from datetime import datetime
 import time
 import json
-import base64
 import random
 import re , urllib.parse
 import httpx
-from typing import Dict, Any, Optional
+from typing import Optional
 import gallery_dl , sys , io
 import gallery_dl.config
 import gallery_dl.job
 from fastapi import FastAPI, Query, HTTPException , Request
 from fastapi.responses import JSONResponse
-import yt_dlp, uuid , psutil
-import boto3
-import subprocess
-from boto3.s3.transfer import TransferConfig
-from botocore.client import Config as BotocoreConfig
+import yt_dlp, uuid , psutil , redis
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
 from cryptography.fernet import Fernet
+
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", b'wxk9V_lppKFwN1LzRroxrXOxKxhhRD2GhhxVhwLxflw=')  # Example key; replace with your actual key
 fernet = Fernet(ENCRYPTION_KEY)
 load_dotenv()
 
 # ---------------- Settings ----------------
 TEMP_DIR = "./videos"
+
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 app = FastAPI()
+
 API_KEY = "all-7f04e0d887372e3769b200d990ae7868"
-# Global tasks dictionary (from your original code)
-tasks: Dict[str, Dict[str, Any]] = {}
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -42,179 +37,74 @@ USER_AGENTS = [
 ]
 
 BASE_YTDL_OPTS = {
-    "quiet": False,
+    "quiet": True,             # suppress extra logs
     "no_warnings": True,
-    "ignoreerrors": False,
-    "extract_flat": False,
+    "ignoreerrors": True,      # skip problematic videos
+    "extract_flat": False,     # fully resolves video info, but no download
+    "skip_download": True,     # do not download video/audio
     "geo_bypass": True,
     "nocheckcertificate": True,
-    "socket_timeout": 30,
-    "retries": 3,
+    "socket_timeout": 10,      # faster fail if network is slow
+    "retries": 1,              # avoid long retry delays
+    "format": "best",          # ensures you get best video/audio links
+    "writeinfojson": False,    # do not write extra files
+    "writethumbnail": True,    # get thumbnail URL
+    "writesubtitles": False,
+    "writeautomaticsub": False,
     "http_headers": {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept-Language": "en-US,en;q=0.9",
     },
 }
 
-# make sure env vars present
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
-R2_BUCKET = os.getenv("R2_BUCKET")
-R2_REGION = os.getenv("R2_REGION", "auto")  # optional
+class RedisDict:
+    def __init__(self, redis_client, prefix="task:"):
+        self.r = redis_client
+        self.prefix = prefix
 
-# R2 endpoint
-R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    def _key(self, k):
+        return f"{self.prefix}{k}"
 
-# boto3 client
-r2 = boto3.client(
-    "s3",
-    region_name=R2_REGION if R2_REGION else None,
-    endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY,
-    aws_secret_access_key=R2_SECRET_KEY,
-    config=BotocoreConfig(signature_version="s3v4"),
+    def __setitem__(self, k, v):
+        # store as JSON
+        self.r.set(self._key(k), json.dumps(v))
+
+    def __getitem__(self, k):
+        raw = self.r.get(self._key(k))
+        if raw is None:
+            raise KeyError(k)
+        return json.loads(raw)
+
+    def __delitem__(self, k):
+        self.r.delete(self._key(k))
+
+    def __contains__(self, k):
+        return self.r.exists(self._key(k)) > 0
+
+    def items(self):
+        keys = self.r.keys(f"{self.prefix}*")
+        for key in keys:
+            task_id = key.decode("utf-8").replace(self.prefix, "")
+            raw = self.r.get(key)
+            if raw:
+                yield task_id, json.loads(raw)
+
+    def keys(self):
+        keys = self.r.keys(f"{self.prefix}*")
+        return [key.decode("utf-8").replace(self.prefix, "") for key in keys]
+
+    def __len__(self):
+        return len(self.keys())
+
+redis_client = redis.Redis(
+    host="redis-16144.c279.us-central1-1.gce.redns.redis-cloud.com",
+    port=16144,
+    decode_responses=True,
+    username="default",
+    password="ePDaUFP9aJmPfYiLAqnqGk6MD6RmarKp",
 )
 
-def generate_signed_urls(key: str, expire_seconds: int = 43200):
-    """Generate both streaming + download signed URLs (expire in 12h by default)"""
-    # Streaming (inline) - Add Content-Type for video streaming
-    streaming_url = r2.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": R2_BUCKET,
-            "Key": key,
-            "ResponseContentType": "video/mp4",
-            "ResponseContentDisposition": "inline",  # Just inline without filename for streaming
-        },
-        ExpiresIn=expire_seconds,
-    )
-
-    # Download (attachment)
-    download_url = r2.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": R2_BUCKET,
-            "Key": key,
-            "ResponseContentType": "video/mp4",
-            "ResponseContentDisposition": f'attachment; filename="{os.path.basename(key)}"',
-        },
-        ExpiresIn=expire_seconds,
-    )
-
-    return {
-        "stream": streaming_url,  # For video player streaming
-        "download": download_url  # For direct download
-    }
-
-class ProgressCallback:
-    def __init__(self, task_id, data, start, end, total_bytes):
-        self.task_id = task_id
-        self.data = data
-        self.start = start
-        self.end = end
-        self.total = float(total_bytes)
-        self.lock = threading.Lock()
-        self.uploaded = 0
-        self.last_ts = time.time()
-        self.last_uploaded = 0
-        # smoothing window
-        self.recent_bytes = 0
-        self.recent_ts = self.last_ts
-
-    def __call__(self, bytes_amount):
-        with self.lock:
-            now = time.time()
-            self.uploaded += bytes_amount
-            # compute percent of this stage
-            percent = 0
-            if self.total > 0:
-                percent = min(int((self.uploaded / self.total) * 100), 100)
-            scaled = self.start + (percent * (self.end - self.start) // 100)
-            # compute upload speed (MiB/s) over last short window
-            dt = now - self.recent_ts
-            if dt <= 0:
-                speed_str = "0MiB"
-            else:
-                self.recent_bytes += bytes_amount
-                # every call older than 0.5s, compute speed and reset
-                if dt >= 0.5:
-                    speed_bps = self.recent_bytes / dt
-                    speed_mib = speed_bps / (1024 * 1024)
-                    speed_str = f"{round(speed_mib, 2)}MiB"
-                    # reset window
-                    self.recent_ts = now
-                    self.recent_bytes = 0
-                else:
-                    # fallback to instant delta from last recorded
-                    delta = self.uploaded - self.last_uploaded
-                    dt_full = now - self.last_ts if (now - self.last_ts) > 0 else 1e-6
-                    speed_mib = (delta / dt_full) / (1024 * 1024)
-                    speed_str = f"{round(speed_mib, 2)}MiB"
-
-            # update last markers
-            self.last_uploaded = self.uploaded
-            self.last_ts = now
-
-            # human readable uploaded / total
-            uploaded_hr = bytes_to_mib_str(self.uploaded)
-            total_hr = bytes_to_mib_str(self.total)
-
-            self.data["progress"] = min(scaled, self.end)
-            self.data["stage"] = "uploading"
-            self.data["uploaded"] = uploaded_hr
-            self.data["total"] = total_hr
-            self.data["speed"] = speed_str
-            tasks[self.task_id]["encrypted"] = encrypt_task_data(self.data)
-
-def upload_with_progress(local_path, key, task_id, data, start=95, end=100):
-    """
-    Upload local_path to R2 with callback; on error update task data and re-raise.
-    """
-    if not os.path.exists(local_path):
-        raise FileNotFoundError(local_path)
-
-    size_bytes = os.path.getsize(local_path)
-    cb = ProgressCallback(task_id, data, start, end, size_bytes)
-
-    transfer_config = TransferConfig(
-        multipart_threshold=5 * 1024 * 1024,
-        multipart_chunksize=5 * 1024 * 1024,
-        max_concurrency=16,
-        use_threads=True,
-    )
-
-    # ensure stage/progress start for upload
-    data["stage"] = "uploading"
-    data["status"] = "uploading"
-    data["progress"] = start
-    data["uploaded"] = "0MiB"
-    data["total"] = bytes_to_mib_str(size_bytes)
-    data["speed"] = "0MiB"
-    tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-    try:
-        r2.upload_file(
-            Filename=local_path,
-            Bucket=R2_BUCKET,
-            Key=key,
-            Callback=cb,
-            Config=transfer_config,
-        )
-    except Exception as e:
-        # attach upload error details to task data
-        data["status"] = "error"
-        data["error"] = f"upload failed: {repr(e)}"
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-        raise  # re-raise so caller (worker) will handle and cleanup
-
-    # ensure final state after success
-    data["progress"] = end
-    data["uploaded"] = bytes_to_mib_str(size_bytes)
-    data["speed"] = "0MiB"
-    tasks[task_id]["encrypted"] = encrypt_task_data(data)
-    return True
-
+tasks = RedisDict(redis_client)
 # ---------------- Utilities ----------------
 def encrypt_task_data(data: dict) -> str:
     json_bytes = json.dumps(data, ensure_ascii=False).encode('utf-8')
@@ -351,9 +241,7 @@ MAX_FREE_SIZE = 1 * 1024 * 1024 * 1024
 from fastapi import  BackgroundTasks
 
 # Global in-memory store
-url_tasks: dict[str, dict] = {}  # {url: {status, stage, progress, result, error}}
-
-tasks = {}      # {task_id: {data}}
+url_tasks: dict[str, dict] = {}  # {url: {status, stage, progress, result, error}}    # {task_id: {data}}
 @app.get("/")
 def list_qualities(url: str = Query(None), key: str = Query(None), background_tasks: BackgroundTasks = None):
     if url is None or key is None:
@@ -448,15 +336,17 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
             for f in unique_audios.values():
                 filesize = f.get("filesize") or f.get("filesize_approx") or 0
                 audio_url_encoded = urllib.parse.quote_plus(f.get("url"))
-                # Replace problematic characters (including \u2019) for safe filenames/URLs
                 safe_audio_title = re.sub(r'[\\/*?:"<>]', "-", info.get("title", "audio")).replace(" ", "-")
+
                 audios.append({
                     "quality": f"Audio {f.get('abr', 0)}kbps",
                     "ext": f.get("ext"),
                     "size": sizeof_fmt(filesize),
                     "streaming_url": f.get("url"),
                     "downloading_url": f"/download-audio?url={audio_url_encoded}&title={safe_audio_title}&key={key}",
-                    "raw_size": filesize
+                    "raw_size": filesize,
+                    "url": f.get("url"),        # ✅ keep actual url
+                    "abr": f.get("abr", 0)      # ✅ keep bitrate for selection
                 })
 
             # VIDEO
@@ -472,7 +362,12 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
                     continue
                 seen_resolutions.add(height)
                 video_size = (f.get("filesize") or f.get("clen") or f.get("filesize_approx") or 0)
-                best_audio = audios[0] if audios else {"raw_size": 0}
+                # pick best audio safely
+                if audios:
+                    # choose audio with highest bitrate if available
+                    best_audio = max(audios, key=lambda a: a.get("abr") or 0)
+                else:
+                    best_audio = None
                 total_size = video_size + best_audio.get("raw_size", 0)
 
                 if f.get("acodec") != "none":
@@ -498,9 +393,15 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
                     task_id = str(uuid.uuid4())
                     task_data = {
                         "url": url,
-                        "video_format": f,
                         "title": info.get("title", "Unknown"),
-                        "audio_format": best_audio,
+                        "video_format": {
+                            "url": f.get("url"),
+                            "ext": f.get("ext") or "mp4",
+                        },
+                        "audio_format": {
+                            "url": best_audio.get("url"),
+                            "ext": best_audio.get("ext") or "m4a",
+                        },
                         "needs_merge": True,
                         "status": "waiting",
                         "progress": 0,
@@ -553,396 +454,9 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
         "message": "Extraction started, refresh to see progress"
     }
 
-def bytes_to_mib_str(n):
-    return f"{round(n / (1024*1024), 2)}MiB"
-
-# Robust parser for aria2 progress lines
-def parse_aria2_line(line):
-    """
-    Try several patterns and return a dict with any of:
-    { 'downloaded': '27MiB', 'total': '28MiB', 'percent': 95, 'speed': '1.0MiB' }
-    """
-    line = line.strip()
-
-    # Pattern 1 (most complete): downloaded/total(percent) ... DL:speed
-    p1 = re.search(r"([\d\.]+[KkMmGgTtPp]i?[Bb]?)/([\d\.]+[KkMmGgTtPp]i?[Bb]?)\s*\((\d+)%\).*?DL:([\d\.]+\w*)", line)
-    if p1:
-        return {
-            "downloaded": p1.group(1),
-            "total": p1.group(2),
-            "percent": int(p1.group(3)),
-            "speed": p1.group(4),
-        }
-
-    # Pattern 2: downloaded/total(percent) (no DL:)
-    p2 = re.search(r"([\d\.]+[KkMmGgTtPp]i?[Bb]?)/([\d\.]+[KkMmGgTtPp]i?[Bb]?)\s*\((\d+)%\)", line)
-    if p2:
-        return {
-            "downloaded": p2.group(1),
-            "total": p2.group(2),
-            "percent": int(p2.group(3)),
-            "speed": None,
-        }
-
-    # Pattern 3: percent and DL only (e.g. "(95%) ... DL:1.0MiB")
-    p3 = re.search(r"\((\d+)%\).*?DL:([\d\.]+\w*)", line)
-    if p3:
-        return {"percent": int(p3.group(1)), "speed": p3.group(2)}
-
-    # Pattern 4: DL only
-    p4 = re.search(r"DL:([\d\.]+\w*)", line)
-    if p4:
-        return {"speed": p4.group(1)}
-
-    # nothing matched
-    return {}
-
-def run_with_progress(cmd, start, end, task_id, data, output_file=None, update_every_n_lines=1):
-    """
-    Run a subprocess (aria2c) and parse its stdout to update task progress.
-    - `start`/`end` define the scaled progress range for this step (0..100).
-    - `output_file` is used as fallback to compute final size if aria2 output was missed.
-    """
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True
-    )
-
-    matched_any = False
-    line_count = 0
-
-    try:
-        # iterate lines as they arrive (works with text=True)
-        for raw_line in proc.stdout:
-            line_count += 1
-            line = raw_line.strip()
-            # optional debug: print("ARIA2:", line)
-
-            parsed = parse_aria2_line(line)
-            if parsed:
-                matched_any = True
-
-            # Apply parsed fields to data
-            if parsed.get("percent") is not None:
-                percent = parsed["percent"]
-                # scale percent to stage range
-                scaled = start + (percent * (end - start) // 100)
-                data["progress"] = scaled
-
-            if parsed.get("speed") is not None:
-                data["speed"] = parsed["speed"]
-
-            if parsed.get("downloaded") is not None:
-                data["downloaded"] = parsed["downloaded"]
-
-            if parsed.get("total") is not None:
-                data["total"] = parsed["total"]
-
-            # ensure stage remains set (video/audio)
-            data["stage"] = data.get("stage") or ("video" if start < end and start == 0 else data.get("stage"))
-
-            # write update back to tasks — do this not too often to reduce overhead
-            if line_count % update_every_n_lines == 0 or parsed:
-                tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-        # Wait for process to finish (ensure returncode set)
-        proc.wait(timeout=5)
-    except Exception as e:
-        # If we were interrupted, kill process and record error
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        data["status"] = "error"
-        data["error"] = f"run_with_progress exception: {e}"
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-        return False
-
-    # Completed run: ensure final progress and fallback
-    data["progress"] = end
-    data["speed"] = "0MiB"
-
-    if not matched_any and output_file and os.path.exists(output_file):
-        # fallback to actual file size if aria2 produced no parseable output
-        size_bytes = os.path.getsize(output_file)
-        data["downloaded"] = bytes_to_mib_str(size_bytes)
-        data["total"] = data["downloaded"]
-
-    tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-    return proc.returncode == 0
-
-def worker(task_id, data):
-    video_file = audio_file = output_file = None
-    try:
-        video_url = data["video_format"].get("url")
-        audio_url = data["audio_format"].get("url") or data["audio_format"].get("streaming_url")
-
-        os.makedirs("./tmp", exist_ok=True)
-        video_file = f"./tmp/{task_id}_video.mp4"
-        audio_file = f"./tmp/{task_id}_audio.mp3"
-        title = re.sub(r'[\\/*?:"<>|]', "_", data.get("title", "video"))
-        format = data["video_format"].get("ext", "mp4")
-        output_file = f"./tmp/{title}_{format}.mp4"
-
-        # --- Video download (0–45) ---
-        data["status"] = "downloading"
-        data["stage"] = "video"
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-        save_tasks()
-
-        run_with_progress(
-            [
-                "aria2c",
-                "-x", "16", "-s", "16", "-k", "1M",
-                "--allow-piece-length-change=true",
-                "--file-allocation=none",
-                "--disable-ipv6",
-                "--enable-http-pipelining",
-                "--http-accept-gzip",
-                "--auto-file-renaming=false",
-                "--summary-interval=1",
-                "--timeout=30", "--connect-timeout=30",
-                "--retry-wait=2", "--max-tries=15",
-                "--min-split-size=1M", "--check-integrity=true",
-                "-o", video_file,
-                video_url,
-            ],
-            0, 45, task_id, data, output_file=video_file
-        )
-
-        # --- Audio download (45–90) ---
-        data["stage"] = "audio"
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-        run_with_progress(
-            [
-                "aria2c",
-                "-x", "16", "-s", "16", "-k", "1M",
-                "--allow-piece-length-change=true",
-                "--file-allocation=none",
-                "--disable-ipv6",
-                "--enable-http-pipelining",
-                "--http-accept-gzip",
-                "--auto-file-renaming=false",
-                "--summary-interval=1",
-                "--timeout=30", "--connect-timeout=30",
-                "--retry-wait=2", "--max-tries=15",
-                "--min-split-size=1M", "--check-integrity=true",
-                "-o", audio_file,
-                audio_url,
-            ],
-            45, 90, task_id, data, output_file=audio_file
-        )
-
-        # --- Merge (90–95) ---
-        data["stage"] = "merging"
-        data["status"] = "merging"
-        data["progress"] = 90
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y", "-nostdin",
-                "-i", video_file,
-                "-i", audio_file,
-                "-c", "copy",
-                output_file
-            ],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"FFmpeg failed: {result.stderr}")
-
-        # mark merge done
-        data["progress"] = 95
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-        # --- Upload (95–100) ---
-        data["stage"] = "uploading"
-        data["status"] = "uploading"
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-        r2_key = f"videos/{task_id}.mp4"
-        upload_with_progress(output_file, r2_key, task_id, data, 95, 100)
-        expire_seconds = 43200
-        stream_url = r2.generate_presigned_url(
-            "get_object",
-            Params={
-                "Bucket": R2_BUCKET,
-                "Key": r2_key,
-                "ResponseContentType": "video/mp4",
-                "ResponseContentDisposition": "inline",  # For streaming
-            },
-            ExpiresIn=expire_seconds,
-        )
-        download_url = r2.generate_presigned_url(
-            "get_object",
-            Params={
-                "Bucket": R2_BUCKET,
-                "Key": r2_key,
-                "ResponseContentType": "video/mp4",
-                "ResponseContentDisposition": f'attachment; filename="{os.path.basename(output_file)}"',  # user sees title.mp4
-            },
-            ExpiresIn=expire_seconds,
-        )
-
-        data["status"] = "done"
-        data["stage"] = "finished"
-        data["progress"] = 100
-        data["stream_url"] = stream_url
-        data["download_url"] = download_url
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-    except Exception as e:
-        data["status"] = "error"
-        data["error"] = str(e)
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-    finally:
-        # --- Cleanup local files ---
-        for f in [video_file, audio_file, output_file]:
-            try:
-                if f and os.path.exists(f):
-                    os.remove(f)
-            except Exception:
-                pass
-
-# Limit of concurrent running tasks
-MAX_PARALLEL_TASKS = 25
-task_semaphore = threading.Semaphore(MAX_PARALLEL_TASKS)
-
-TASKS_FILE = "./tasks.json"
-
-# Load tasks from disk
-if os.path.exists(TASKS_FILE):
-    with open(TASKS_FILE, "r") as f:
-        tasks = json.load(f)
-else:
-    tasks = {}
-
-def save_tasks():
-    with open(TASKS_FILE, "w") as f:
-        json.dump(tasks, f)
-
-# --- Semaphore for concurrent tasks ---
-task_semaphore = threading.Semaphore(MAX_PARALLEL_TASKS)
-
-# --- Worker launcher ---
-def start_task_in_background(task_id, data):
-    def run_worker(task_id, data):
-        try:
-            worker(task_id, data)
-        finally:
-            task_semaphore.release()  # free slot when done
-
-    acquired = task_semaphore.acquire(blocking=False)
-    if acquired:
-        data["status"] = "running"
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-        thread = threading.Thread(target=run_worker, args=(task_id, data), daemon=True)
-        thread.start()
-    else:
-        data["status"] = "queued"
-        tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-# --- Auto-resume tasks on startup ---
-for task_id, task in tasks.items():
-    data = decrypt_task_data(task["encrypted"])
-    if data.get("status") in ["running", "queued"]:
-        # reset any stuck tasks to waiting
-        data["status"] = "waiting"
-        task["encrypted"] = encrypt_task_data(data)
-
-# Save the cleaned-up task states
-save_tasks()
-
-# Start all waiting tasks respecting semaphore
-for task_id, task in tasks.items():
-    data = decrypt_task_data(task["encrypted"])
-    if data.get("status") == "waiting":
-        start_task_in_background(task_id, data)
-
-@app.get("/progress/{task_id}")
-def progress(task_id: str, key: str = Query(...)):
-    if key != API_KEY:
-        raise HTTPException(403, "Invalid API key")
-    if task_id not in tasks:
-        return {"status": "unknown", "error": "Task not found"}
-
-    t = tasks[task_id]
-    data = decrypt_task_data(t["encrypted"])
-    save_cache()
-    # Only start worker if waiting
-    if data.get("status") == "waiting":
-
-        # Try to acquire a semaphore slot
-        acquired = task_semaphore.acquire(blocking=False)
-        if acquired:
-            data["status"] = "running"
-            tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-            def run_worker(task_id, data):
-                try:
-                    worker(task_id, data)
-                finally:
-                    # Release semaphore when done
-                    task_semaphore.release()
-
-            thread = threading.Thread(target=run_worker, args=(task_id, data), daemon=True)
-            thread.start()
-        else:
-            # Keep task in waiting state; it will auto-start later
-            data["status"] = "queued"
-            tasks[task_id]["encrypted"] = encrypt_task_data(data)
-
-    return {
-        "status": data.get("status"),
-        "stage": data.get("stage"),
-        "progress": data.get("progress", 0),
-        "downloaded": data.get("downloaded"),
-        "total": data.get("total"),
-        "speed": data.get("speed"),
-        "stream_url": data.get("stream_url"),
-        "download_url": data.get("download_url"),
-    }
-
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "timestamp": time.time()}
-
-# Clean up old tasks periodically
-def cleanup_old_tasks():
-    while True:
-        try:
-            current_time = time.time()
-            old_tasks = []
-
-            for task_id, task in list(tasks.items()):
-                try:
-                    data = decrypt_task_data(task["encrypted"])
-                    if current_time - data.get("timestamp", 0) > 43200:  # 12 hours
-                        # delete from R2 if uploaded
-                        key = f"videos/{task_id}.mp4"
-                        try:
-                            r2.delete_object(Bucket=R2_BUCKET, Key=key)
-                        except Exception as e:
-                            print(f"Failed to delete {key}: {e}")
-                        old_tasks.append(task_id)
-                except Exception:  # malformed task
-                    old_tasks.append(task_id)
-
-            for task_id in old_tasks:
-                tasks.pop(task_id, None)
-
-        except Exception as e:
-            print(f"Cleanup error: {e}")
-
-        time.sleep(300)  # run every 5 minutes
 
 def normalize_instagram_url(url: str) -> str:
     if url.startswith("https:/") and not url.startswith("https://"):
@@ -1155,6 +669,3 @@ def stats(key: str = Query(...)):
         "memory_usage": f"{round(mem.used / (1024*1024), 2)} MiB / {round(mem.total / (1024*1024), 2)} MiB",
         "cpu_usage_percent": cpu
     }
-
-# Start cleanup thread
-threading.Thread(target=cleanup_old_tasks, daemon=True).start()
