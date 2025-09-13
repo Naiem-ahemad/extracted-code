@@ -119,8 +119,8 @@ def decrypt_task_data(data: str) -> dict:
     return json.loads(decrypted_bytes.decode('utf-8'))
 
 COOKIES_MAP = {
-    "youtube.com": "./cookies/yt.txt",
-    "youtu.be": "./cookies/yt.txt",
+    "youtube.com": "./cookies/yt1.txt",
+    "youtu.be": "./cookies/yt1.txt",
     "facebook.com": "./cookies/fb.txt",
     "x.com": "./cookies/x.txt",
     "twitter.com": "./cookies/x.txt",
@@ -571,6 +571,11 @@ def clean_cache():
 
 def extract_playlist(url: str):
     """Step 1: Return minimal playlist metadata (number + title)"""
+    def normalize_url(url: str) -> str:
+        if "music.youtube.com" in url:
+            return url.replace("music.youtube.com", "www.youtube.com")
+        return url
+    url1 = normalize_url(url)
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
@@ -586,7 +591,7 @@ def extract_playlist(url: str):
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+        info = ydl.extract_info(url1, download=False)
 
     songs = []
     for i, entry in enumerate(info.get("entries", []), start=1):
@@ -620,45 +625,44 @@ def create_playlist(req: PlaylistRequest):
     }
     return {"session_id": session_id, "songs": songs}
 
+MAX_WORKERS = 15
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
 def get_full_song_data(song_id: str, title: str):
-    """Step 2: Get full song info: thumbnail + audio URL"""
+    """Fetch thumbnail + audio URL in parallel"""
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
         "nocheckcertificate": True,
         "ignoreerrors": True,
         "cachedir": False,
-        "format": "best[height<=360][ext=mp4]/bestaudio/best",
+        "format": "bestaudio/best",
         "noprogress": True,
         "headers": {"User-Agent": random.choice(USER_AGENTS)},
-        "cookiefile": get_cookies_file("youtube.com")
+        "cookiefile": get_cookies_file("youtube.com"),
+
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://music.youtube.com/watch?v={song_id}", download=False)
-        audio_url = info.get("url")
+            info = ydl.extract_info(f"https://youtube.com/watch?v={song_id}", download=False)
         return {
             "title": title,
             "thumbnail": info.get("thumbnail"),
-            "audio_url": audio_url,
-            "video_url": info.get("url")
+            "audio_url": info.get("url"),
+            "video_url": f"https://youtube.com/watch?v={song_id}",
         }
     except Exception as e:
-        return {"title": title, "thumbnail": None, "audio_url": None, "video_url": None, "error": str(e)}
-
-MAX_WORKERS = 15  # Number of parallel threads
-executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        return {"title": title, "error": str(e)}
 
 def fetch_song_data(song_id: str, title: str, session_id: str, num: int):
-    """Background task to fetch full song info"""
+    """Background fetch with caching"""
     try:
         data = get_full_song_data(song_id, title)
         CACHE[session_id]["selected"][num]["data"] = data
-        CACHE[session_id]["selected"][num]["status"] = "done"
+        CACHE[session_id]["selected"][num]["status"] = "done" if "error" not in data else "error"
     except Exception as e:
-        CACHE[session_id]["selected"][num]["error"] = str(e)
         CACHE[session_id]["selected"][num]["status"] = "error"
-        logging.error(f"Failed to fetch song {song_id}: {e}")
+        CACHE[session_id]["selected"][num]["error"] = str(e)
 
 @app.post("/music_playlist/select")
 def select_songs(req: SelectionRequest):
@@ -668,34 +672,34 @@ def select_songs(req: SelectionRequest):
         return {"error": "Invalid or expired session"}
 
     session = CACHE[req.session_id]
+    total = len(req.numbers)
+    done_count = 0
     results = []
 
-    # Initialize songs to fetch
-    tasks = []
     for num in req.numbers:
         song = next((s for s in session["songs"] if s["number"] == num), None)
         if not song:
             results.append({"number": num, "status": "error", "error": "Song not found"})
             continue
 
+        # If not started, launch background task
         if num not in session["selected"]:
             session["selected"][num] = {"status": "running", "data": None, "error": None}
-            tasks.append((song["id"], song["title"], req.session_id, num))
+            executor.submit(fetch_song_data, song["id"], song["title"], req.session_id, num)
+
+        entry = session["selected"][num]
+        if entry["status"] == "done":
+            done_count += 1
+            results.append({"number": num, "status": "done", "song": entry["data"]})
+        elif entry["status"] == "error":
+            results.append({"number": num, "status": "error", "error": entry["error"]})
         else:
-            entry = session["selected"][num]
-            if entry["status"] == "done":
-                results.append({"number": num, "status": "done", "song": entry["data"]})
-            elif entry["status"] == "error":
-                results.append({"number": num, "status": "error", "error": entry["error"]})
-            else:
-                results.append({"number": num, "status": "running"})
+            results.append({"number": num, "status": "running"})
 
-    # Submit all new tasks to executor
-    for song_id, title, session_id, num in tasks:
-        executor.submit(fetch_song_data, song_id, title, session_id, num)
-
-    # Return immediately with status
-    return {"songs": results}
+    return {
+        "progress": f"{done_count}/{total}",
+        "songs": results
+    }
 
 @app.get("/health")
 def health_check():
@@ -766,7 +770,8 @@ async def instagram_reel(url: str = Query(...), key: str = Query(...)):
                 "username": m.get("username"),
                 "fullname": m.get("fullname"),
                 "description": m.get("description"),
-                "media_url": m.get("display_url") or m.get("video_url"),
+                "thumbnail": m.get("display_url"),
+                "video_url": m.get("video_url"),
                 "type": media_type,
                 "width": m.get("width"),
                 "height": m.get("height"),
