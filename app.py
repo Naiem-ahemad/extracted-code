@@ -764,6 +764,13 @@ async def instagram_reel(url: str = Query(...), key: str = Query(...)):
                 all_media.append(item)
         for m in all_media:
             media_type = "video" if m.get("video_url") else "image"
+            extension = m.get("extension") or ("mp4" if media_type=="video" else "jpg")
+            video_url = m.get("video_url")
+            if extension == "mp4":
+                audio_url = "https://middleman-downloader-1.onrender.com/extract-audio?video_url=" + urllib.parse.quote(video_url , safe="")
+            else:
+                audio_url = None
+
             media_list.append({
                 "post_id": m.get("post_id"),
                 "post_url": m.get("post_url"),
@@ -771,11 +778,12 @@ async def instagram_reel(url: str = Query(...), key: str = Query(...)):
                 "fullname": m.get("fullname"),
                 "description": m.get("description"),
                 "thumbnail": m.get("display_url"),
-                "video_url": m.get("video_url"),
+                "video_url": video_url,
+                "audio_url" : audio_url,
                 "type": media_type,
                 "width": m.get("width"),
                 "height": m.get("height"),
-                "extension": m.get("extension") or ("mp4" if media_type=="video" else "jpg"),
+                "extension": extension,
             })
     if not media_list:
         raise HTTPException(status_code=404, detail=f"No media found for {normalized_url}")
@@ -826,7 +834,12 @@ def map_to_clean_json(data):
 
         if not media_url:
             continue
-
+        
+        type = content.get("type") or ("video" if media_url.endswith(".mp4") else "image")
+        if type == "photo":
+            audio_url = None
+        else:
+            audio_url = "https://middleman-downloader-1.onrender.com/extract-audio?video_url=" + urllib.parse.quote(media_url , safe="")
         media_list.append({
             "tweet_id": content.get("tweet_id"),
             "username": content.get("user", {}).get("nick") or content.get("author", {}).get("nick"),
@@ -836,6 +849,7 @@ def map_to_clean_json(data):
             "filename": content.get("filename"),
             "type": content.get("type") or ("video" if media_url.endswith(".mp4") else "image"),
             "extension": content.get("extension") or media_url.split(".")[-1],
+            "audio_url" : audio_url,
             "width": content.get("width"),
             "height": content.get("height"),
             "followers_count": content.get("user", {}).get("followers_count"),
