@@ -7,7 +7,7 @@ import random
 import re , urllib.parse
 import httpx
 from typing import Optional
-import gallery_dl , sys , io
+import gallery_dl , sys , io , zlib , base64
 import gallery_dl.config
 import gallery_dl.job
 from fastapi import FastAPI, Query, HTTPException , Request
@@ -60,63 +60,20 @@ BASE_YTDL_OPTS = {
     },
 }
 
-class RedisDict:
-    def __init__(self, redis_client, prefix="task:"):
-        self.r = redis_client
-        self.prefix = prefix
-
-    def _key(self, k):
-        return f"{self.prefix}{k}"
-
-    def __setitem__(self, k, v):
-        # store as JSON
-        self.r.set(self._key(k), json.dumps(v))
-
-    def __getitem__(self, k):
-        raw = self.r.get(self._key(k))
-        if raw is None:
-            raise KeyError(k)
-        return json.loads(raw)
-
-    def __delitem__(self, k):
-        self.r.delete(self._key(k))
-
-    def __contains__(self, k):
-        return self.r.exists(self._key(k)) > 0
-
-    def items(self):
-        keys = self.r.keys(f"{self.prefix}*")
-        for key in keys:
-            task_id = key.decode("utf-8").replace(self.prefix, "")
-            raw = self.r.get(key)
-            if raw:
-                yield task_id, json.loads(raw)
-
-    def keys(self):
-        keys = self.r.keys(f"{self.prefix}*")
-        return [key.decode("utf-8").replace(self.prefix, "") for key in keys]
-
-    def __len__(self):
-        return len(self.keys())
-
-redis_client = redis.Redis(
-    host="redis-16144.c279.us-central1-1.gce.redns.redis-cloud.com",
-    port=16144,
-    decode_responses=True,
-    username="default",
-    password="ePDaUFP9aJmPfYiLAqnqGk6MD6RmarKp",
-)
-
-tasks = RedisDict(redis_client)
 # ---------------- Utilities ----------------
 def encrypt_task_data(data: dict) -> str:
-    json_bytes = json.dumps(data, ensure_ascii=False).encode('utf-8')
-    encrypted_bytes = fernet.encrypt(json_bytes)
-    return encrypted_bytes.decode('utf-8')
+    # JSON → compress → encrypt → base64-url-safe
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    compressed = zlib.compress(raw)
+    encrypted = fernet.encrypt(compressed)
+    return base64.urlsafe_b64encode(encrypted).decode("utf-8")
 
 def decrypt_task_data(data: str) -> dict:
-    decrypted_bytes = fernet.decrypt(data.encode('utf-8'))
-    return json.loads(decrypted_bytes.decode('utf-8'))
+    # base64-url-safe → decrypt → decompress → JSON
+    encrypted = base64.urlsafe_b64decode(data.encode("utf-8"))
+    compressed = fernet.decrypt(encrypted)
+    raw = zlib.decompress(compressed)
+    return json.loads(raw.decode("utf-8"))
 
 COOKIES_MAP = {
     "youtube.com": "./cookies/yt1.txt",
@@ -448,7 +405,6 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
                             "message": "File too large for free users, membership required"
                         })
                         continue
-                    task_id = str(uuid.uuid4())
                     task_data = {
                         "url": url,
                         "title": info.get("title", "Unknown"),
@@ -468,7 +424,7 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
                         "error": None,
                         "timestamp": time.time(),
                     }
-                    tasks[task_id] = {"encrypted": encrypt_task_data(task_data)}
+                    task_id = encrypt_task_data(task_data)
 
                     qualities.append({
                         "quality": f"{height}p",
@@ -883,51 +839,4 @@ async def twitter_media(url: str = Query(...), key: str = Query(...)):
     return {
         "twitter_url": url,
         "media": media_list
-    }
-
-@app.get("/stats")
-def stats(key: str = Query(...)):
-    if key != API_KEY:
-        raise HTTPException(403, "Invalid API key")
-    
-    total_tasks = len(tasks)
-    active_tasks = 0
-    total_downloaded_bytes = 0
-    task_details = []
-
-    for task_id, task in tasks.items():
-        data = decrypt_task_data(task["encrypted"])
-        if data.get("status") in ("running", "uploading", "merging"):
-            active_tasks += 1
-
-        downloaded_str = data.get("downloaded")
-        if downloaded_str:
-            match = re.match(r"([\d\.]+)([KMG]i?)B", downloaded_str)
-            if match:
-                num, unit = match.groups()
-                num = float(num)
-                factor = {"K": 1024, "Ki": 1024, "M": 1024**2, "Mi": 1024**2, "G": 1024**3, "Gi": 1024**3}.get(unit, 1)
-                total_downloaded_bytes += int(num * factor)
-        
-        task_details.append({
-            "task_id": task_id,
-            "status": data.get("status"),
-            "stage": data.get("stage"),
-            "progress": data.get("progress", 0),
-            "downloaded": data.get("downloaded"),
-            "total": data.get("total"),
-            "speed": data.get("speed"),
-        })
-
-    # Optional: Render server memory / CPU
-    mem = psutil.virtual_memory()
-    cpu = psutil.cpu_percent(interval=0.1)
-
-    return {
-        "total_tasks": total_tasks,
-        "active_tasks": active_tasks,
-        "total_downloaded": f"{round(total_downloaded_bytes / (1024*1024), 2)} MiB",
-        "tasks": task_details,
-        "memory_usage": f"{round(mem.used / (1024*1024), 2)} MiB / {round(mem.total / (1024*1024), 2)} MiB",
-        "cpu_usage_percent": cpu
     }
