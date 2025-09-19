@@ -10,7 +10,7 @@ from typing import Optional
 import gallery_dl , sys , io , zlib , base64
 import gallery_dl.config
 import gallery_dl.job
-from fastapi import FastAPI, Query, HTTPException , Request
+from fastapi import FastAPI, Query, HTTPException , Request , BackgroundTasks
 from fastapi.responses import JSONResponse
 import yt_dlp, uuid , psutil , redis
 from pydantic import BaseModel
@@ -38,27 +38,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
-
-BASE_YTDL_OPTS = {
-    "quiet": True,             # suppress extra logs
-    "no_warnings": True,
-    "ignoreerrors": True,      # skip problematic videos
-    "extract_flat": False,     # fully resolves video info, but no download
-    "skip_download": True,     # do not download video/audio
-    "geo_bypass": True,
-    "nocheckcertificate": True,
-    "socket_timeout": 10,      # faster fail if network is slow
-    "retries": 1,              # avoid long retry delays
-    "format": "best",          # ensures you get best video/audio links
-    "writeinfojson": False,    # do not write extra files
-    "writethumbnail": True,    # get thumbnail URL
-    "writesubtitles": False,
-    "writeautomaticsub": False,
-    "http_headers": {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept-Language": "en-US,en;q=0.9",
-    },
-}
 
 # ---------------- Utilities ----------------
 def encrypt_task_data(data: dict) -> str:
@@ -196,12 +175,9 @@ async def download(
         }
     )
 
-MAX_FREE_SIZE = 1 * 1024 * 1024 * 1024
- # 200MiB limit for free users
-from fastapi import  BackgroundTasks
+MAX_FREE_SIZE = 1 * 1024 * 1024 * 1024 * 1024
+url_tasks: dict[str, dict] = {}
 
-# Global in-memory store
-url_tasks: dict[str, dict] = {}  # {url: {status, stage, progress, result, error}}    # {task_id: {data}}
 @app.get("/")
 def list_qualities(url: str = Query(None), key: str = Query(None), background_tasks: BackgroundTasks = None):
     if url is None or key is None:
@@ -292,7 +268,8 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
     
     if key != API_KEY:
         raise HTTPException(403, "Invalid API key")
-    # If cached info exists, return immediately
+    
+    # Check cache first
     cached = get_cached_info(url)
     if cached:
         return cached
@@ -302,18 +279,15 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
         task = url_tasks[url]
         return {
             "status": task["status"],
-            "stage": task.get("stage"),
-            "progress": task.get("progress", 0),
             "message": task.get("message"),
-            "result": task.get("result")
+            "result": task.get("result"),
+            "error": task.get("error")
         }
 
     # Initialize extraction task for URL
     url_tasks[url] = {
         "status": "extracting",
-        "stage": "starting",
-        "progress": 0,
-        "message": "Extraction started",
+        "message": "Extracting video information...",
         "result": None,
         "error": None
     }
@@ -321,32 +295,55 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
     def extract_and_cache(url: str):
         try:
             task = url_tasks[url]
-            task["stage"] = "extracting_info"
-            task["progress"] = 10
-
-            ydl_opts = {**BASE_YTDL_OPTS, "skip_download": True}
+            
+            # Optimized yt-dlp options for speed
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "extract_flat": False,
+                "geo_bypass": True,
+                "nocheckcertificate": True,
+                "socket_timeout": 15,
+                "retries": 1,
+                "ignoreerrors": True,
+                # Remove unnecessary options that slow down extraction
+                "writeinfojson": False,
+                "writesubtitles": False,
+                "writeautomaticsub": False,
+                "writethumbnail": False,
+                # Minimal format selection for faster extraction
+                "format_sort": ["res:720", "ext:mp4:m4a"],
+                "http_headers": {
+                    "User-Agent": random.choice(USER_AGENTS),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            }
+            
             cookies_file = get_cookies_file(url)
             if cookies_file:
                 ydl_opts["cookiefile"] = cookies_file
 
+            # Extract info as fast as possible
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
-            task["stage"] = "processing_formats"
-            task["progress"] = 50
-
+            # Quick format filtering - only get what we need
             formats = [f for f in info.get("formats", [])
-                       if f.get("protocol") not in ("m3u8", "m3u8_native") and f.get("url") and f.get("format_id")]
+                       if f.get("protocol") not in ("m3u8", "m3u8_native", "f4f", "f4m") 
+                       and f.get("url") and f.get("format_id")]
 
-            # AUDIO
-            audio_formats = [f for f in formats if f.get("acodec") and f.get("acodec") != "none" and f.get("vcodec") == "none"]
+            # AUDIO - Get top 3 audio formats quickly
+            audio_formats = [f for f in formats 
+                            if f.get("acodec") and f.get("acodec") != "none" and not f.get("vcodec", "none") != "none"]
+            
+            # Sort by quality and get unique extensions
             unique_audios = {}
             for f in sorted(audio_formats, key=lambda x: x.get("abr", 0), reverse=True):
                 ext = f.get("ext")
-                if ext not in unique_audios:
+                if ext not in unique_audios and len(unique_audios) < 3:
                     unique_audios[ext] = f
-                if len(unique_audios) >= 3:
-                    break
+
             audios = []
             for f in unique_audios.values():
                 filesize = f.get("filesize") or f.get("filesize_approx") or 0
@@ -360,43 +357,45 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
                     "streaming_url": f.get("url"),
                     "downloading_url": f"/download-audio?url={audio_url_encoded}&title={safe_audio_title}&key={key}",
                     "raw_size": filesize,
-                    "url": f.get("url"),        # ✅ keep actual url
-                    "abr": f.get("abr", 0)      # ✅ keep bitrate for selection
+                    "abr": f.get("abr", 0)
                 })
 
-            # VIDEO
-            combined_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and f.get("acodec") != "none"]
-            video_only_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none" and (not f.get("acodec") or f.get("acodec") == "none")]
-            all_video_formats = combined_formats + video_only_formats
-
+            # VIDEO - Get video formats efficiently
+            video_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none"]
+            
             qualities = []
             seen_resolutions = set()
-            for f in sorted(all_video_formats, key=lambda x: x.get("height", 0), reverse=True):
+            
+            # Sort by resolution descending and process
+            for f in sorted(video_formats, key=lambda x: x.get("height", 0), reverse=True):
                 height = f.get("height")
                 if height in seen_resolutions:
                     continue
                 seen_resolutions.add(height)
-                video_size = (f.get("filesize") or f.get("clen") or f.get("filesize_approx") or 0)
-                # pick best audio safely
+                
+                video_size = f.get("filesize") or f.get("filesize_approx") or 0
+                has_audio = f.get("acodec") and f.get("acodec") != "none"
+                
+                # Get best audio for size calculation
+                best_audio = None
                 if audios:
-                    # choose audio with highest bitrate if available
-                    best_audio = max(audios, key=lambda a: a.get("abr") or 0)
-                else:
-                    best_audio = None
-                total_size = video_size + best_audio.get("raw_size", 0)
+                    best_audio = max(audios, key=lambda a: a.get("abr", 0))
+                    
+                total_size = video_size + (best_audio.get("raw_size", 0) if best_audio and not has_audio else 0)
 
-                if f.get("acodec") != "none":
+                if has_audio:
+                    # Video with audio - direct download
                     safe_title = re.sub(r'[\\/*?:"<>|]', "-", info.get("title", "video")).replace(" ", "-")
-                    ext = f.get("ext") or "mp4"
                     encoded_url = urllib.parse.quote_plus(f.get("url"))
                     qualities.append({
                         "quality": f"{height}p",
                         "size": sizeof_fmt(video_size),
                         "streaming_url": f.get("url"),
-                        "download_url": f"/download?url={encoded_url}&title={safe_title}&key={key}&type=mp4",
+                        "download_url": f"/download?url={encoded_url}&title={safe_title}&key={key}",
                         "premium": total_size > MAX_FREE_SIZE
                     })
                 else:
+                    # Video without audio - needs merging
                     if total_size > MAX_FREE_SIZE:
                         qualities.append({
                             "quality": f"{height}p",
@@ -405,6 +404,10 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
                             "message": "File too large for free users, membership required"
                         })
                         continue
+                        
+                    if not best_audio:
+                        continue  # Skip if no audio available
+                        
                     task_data = {
                         "url": url,
                         "title": info.get("title", "Unknown"),
@@ -441,31 +444,37 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
                 "audios": audios
             }
 
-            task["stage"] = "done"
-            task["progress"] = 100
             task["status"] = "done"
             task["message"] = "Extraction completed"
             task["result"] = result
 
-            # Save in cache for future hits
+            # Cache the result
             set_cached_info(url, result)
 
         except Exception as e:
-            task["stage"] = "error"
             task["status"] = "error"
             task["error"] = str(e)
             task["message"] = f"Extraction failed: {e}"
-            logging.error(f"Extraction failed for {url}: {e}")
 
-    # Start background extraction
+    # Start background extraction if BackgroundTasks available
     if background_tasks:
         background_tasks.add_task(extract_and_cache, url)
+    else:
+        # If no background tasks, run synchronously (faster for immediate response)
+        extract_and_cache(url)
+        task = url_tasks[url]
+        if task["status"] == "done":
+            return task["result"]
+        else:
+            return {
+                "status": task["status"],
+                "message": task.get("message"),
+                "error": task.get("error")
+            }
 
     return {
         "status": "extracting",
-        "stage": "starting",
-        "progress": 0,
-        "message": "Extraction started, refresh to see progress"
+        "message": "Extracting video information..."
     }
 
 def extract_audio_and_thumbnail(url: str):
