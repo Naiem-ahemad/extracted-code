@@ -1,4 +1,4 @@
-import os , logging , asyncio
+import os , logging , asyncio , itertools
 import asyncio
 from datetime import datetime
 import time
@@ -301,19 +301,15 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
-                "extract_flat": False,
                 "geo_bypass": True,
                 "nocheckcertificate": True,
                 "socket_timeout": 15,
                 "retries": 1,
                 "ignoreerrors": True,
                 # Remove unnecessary options that slow down extraction
-                "writeinfojson": False,
-                "writesubtitles": False,
                 "writeautomaticsub": False,
                 "writethumbnail": False,
                 # Minimal format selection for faster extraction
-                "format_sort": ["res:720", "ext:mp4:m4a"],
                 "http_headers": {
                     "User-Agent": random.choice(USER_AGENTS),
                     "Accept-Language": "en-US,en;q=0.9",
@@ -332,7 +328,7 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
             formats = [f for f in info.get("formats", [])
                        if f.get("protocol") not in ("m3u8", "m3u8_native", "f4f", "f4m") 
                        and f.get("url") and f.get("format_id")]
-
+            
             # AUDIO - Get top 3 audio formats quickly
             audio_formats = [f for f in formats 
                             if f.get("acodec") and f.get("acodec") != "none" and not f.get("vcodec", "none") != "none"]
@@ -360,77 +356,78 @@ def list_qualities(url: str = Query(None), key: str = Query(None), background_ta
                     "abr": f.get("abr", 0)
                 })
 
-            # VIDEO - Get video formats efficiently
+            # VIDEO - Get unique video qualities (prefer merged with audio)
             video_formats = [f for f in formats if f.get("height") and f.get("vcodec") != "none"]
-            
-            qualities = []
-            seen_resolutions = set()
-            
-            # Sort by resolution descending and process
-            for f in sorted(video_formats, key=lambda x: x.get("height", 0), reverse=True):
-                height = f.get("height")
-                if height in seen_resolutions:
+
+            # Group by resolution (height)
+            grouped = {}
+            for f in video_formats:
+                h = f.get("height")
+                if not h:
                     continue
-                seen_resolutions.add(height)
-                
+
+                acodec = f.get("acodec")
+                audio_channels = f.get("audio_channels") or 0
+                try:
+                    audio_channels = int(audio_channels)
+                except:
+                    audio_channels = 0
+
+                has_audio = acodec and acodec != "none" and audio_channels > 0
+
+                # ✅ Prefer merged (with audio), fallback to video-only
+                if h not in grouped or (has_audio and not grouped[h]["has_audio"]):
+                    grouped[h] = {
+                        "format": f,
+                        "has_audio": has_audio
+                    }
+
+            # ✅ Sort resolutions ascending (144p → 2160p)
+            sorted_heights = sorted(grouped.keys())
+
+            qualities = []
+            for h in sorted_heights:
+                f = grouped[h]["format"]
+                has_audio = grouped[h]["has_audio"]
                 video_size = f.get("filesize") or f.get("filesize_approx") or 0
-                has_audio = f.get("acodec") and f.get("acodec") != "none"
-                
-                # Get best audio for size calculation
-                best_audio = None
-                if audios:
-                    best_audio = max(audios, key=lambda a: a.get("abr", 0))
-                    
-                total_size = video_size + (best_audio.get("raw_size", 0) if best_audio and not has_audio else 0)
+                video_url = f.get("url")
+                if not video_url:
+                    continue
+
+                safe_title = re.sub(r'[\\/*?:"<>|]', "-", info.get("title", "video")).replace(" ", "-")
 
                 if has_audio:
-                    # Video with audio - direct download
-                    safe_title = re.sub(r'[\\/*?:"<>|]', "-", info.get("title", "video")).replace(" ", "-")
-                    encoded_url = urllib.parse.quote_plus(f.get("url"))
+                    encoded_url = urllib.parse.quote_plus(video_url)
                     qualities.append({
-                        "quality": f"{height}p",
+                        "quality": f"{h}p",
                         "size": sizeof_fmt(video_size),
-                        "streaming_url": f.get("url"),
+                        "streaming_url": video_url,
                         "download_url": f"/download?url={encoded_url}&title={safe_title}&key={key}",
-                        "premium": total_size > MAX_FREE_SIZE
+                        "premium": video_size > MAX_FREE_SIZE
                     })
                 else:
-                    # Video without audio - needs merging
-                    if total_size > MAX_FREE_SIZE:
-                        qualities.append({
-                            "quality": f"{height}p",
-                            "size": sizeof_fmt(total_size),
-                            "premium": True,
-                            "message": "File too large for free users, membership required"
-                        })
-                        continue
-                        
+                    # fallback merge
+                    valid_audios = [
+                        a for a in formats
+                        if a.get("acodec") and a.get("acodec") != "none" and a.get("abr")
+                    ]
+                    best_audio = max(valid_audios, key=lambda a: a.get("abr", 0), default=None)
                     if not best_audio:
-                        continue  # Skip if no audio available
-                        
+                        continue
+
+                    total_size = video_size + (best_audio.get("raw_size", 0) or 0)
+                    safe_title = re.sub(r'[\\/*?:"<>|]', "-", info.get("title", "video")).replace(" ", "-")
                     task_data = {
                         "url": url,
-                        "title": info.get("title", "Unknown"),
-                        "video_format": {
-                            "url": f.get("url"),
-                            "ext": f.get("ext") or "mp4",
-                        },
-                        "audio_format": {
-                            "url": best_audio.get("url"),
-                            "ext": best_audio.get("ext") or "m4a",
-                        },
-                        "needs_merge": True,
-                        "status": "waiting",
-                        "progress": 0,
-                        "stage": None,
-                        "file": None,
-                        "error": None,
+                        "quality": f.get("format_note"),
+                        "format_id":f.get("format_id"),
+                        "title":safe_title,
                         "timestamp": time.time(),
                     }
                     task_id = encrypt_task_data(task_data)
 
                     qualities.append({
-                        "quality": f"{height}p",
+                        "quality": f"{h}p",
                         "size": sizeof_fmt(total_size),
                         "progress_url": f"/progress/{task_id}?key={key}"
                     })
@@ -699,14 +696,24 @@ def get_instagram_json_data(url: str, cookies_path: str):
         raise RuntimeError("gallery-dl returned no data. Check cookies or URL.")
     return job.data, url
 
+# List your cookie files
+cookie_files = [
+    "./cookies/insta1.txt",
+    "./cookies/insta2.txt",
+    "./cookies/insta3.txt"
+]
+
+# Create an infinite iterator to rotate cookies
+cookie_cycle = itertools.cycle(cookie_files)
+
 @app.get("/instagram")
 async def instagram_reel(url: str = Query(...), key: str = Query(...)):
     if key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
+    cookie_file = next(cookie_cycle)
     # Run gallery-dl in thread to avoid blocking
     loop = asyncio.get_event_loop()
-    results, normalized_url = await loop.run_in_executor(None, get_instagram_json_data, normalize_instagram_url(url), "./cookies/insta.txt")
-
+    results, normalized_url = await loop.run_in_executor(None, get_instagram_json_data, normalize_instagram_url(url), cookie_file)
     media_list = []
     for entry in results:
         if isinstance(entry, tuple):
